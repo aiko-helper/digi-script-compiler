@@ -1,0 +1,6 @@
+*.o
+*.d
+extract
+digi-disasm
+dg/
+*.dgs
