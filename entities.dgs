@@ -704,6 +704,8 @@ symbols {
     MGEN10 = 254;
   }
   pstat {
+    LoopIterator = 101;
     SavedTime = 105;
+    LastBiyomonChaseLocation = 112;
   }
 }

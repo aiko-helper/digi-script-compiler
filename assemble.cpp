@@ -620,6 +620,7 @@ ContainerAST parseSource(std::string_view text) {
     bool hasSectionOrder = false;
     std::vector<std::string> pendingLabels;
     int nextSwitchId = 0;
+    int nextLoopId   = 0;
 
     // File-scope `const NAME = <expr>;` bindings, substituted into every
     // subsequent line at pull time.  `constsStr` caches the value as text
@@ -1180,6 +1181,151 @@ ContainerAST parseSource(std::string_view text) {
                 continue;
             }
             // else: traditional `switch (expr) {...}` -- fall through to statement handler.
+        }
+
+        // `loop { <body> }` -- infinite loop expressed via gotos.  `break;`
+        // and `continue;` inside the body jump to a synthetic end / start
+        // label respectively.  Nested `loop {}`s have their own scope, so
+        // substitution skips body content inside any nested `loop {`.  Other
+        // block-bodied constructs (`for`, `choice`, `switch`, ...) are NOT
+        // skipped: their expansions inherit the enclosing loop's `break` /
+        // `continue` once the expanded lines re-enter the line stream.
+        if (inSection && startsWith(line, "loop")
+            && (line.size() == 4 || line[4] == ' ' || line[4] == '\t' || line[4] == '{')) {
+            std::size_t lb = line.find('{');
+            std::string body;
+            int depth = 1;
+            if (lb != std::string_view::npos) {
+                for (std::size_t i = lb + 1; i < line.size(); ++i) {
+                    char c = line[i];
+                    if (c == '{') depth++;
+                    else if (c == '}') { depth--; if (depth == 0) break; }
+                    body += c;
+                }
+            } else {
+                while (true) {
+                    if (!pullLine()) throw std::runtime_error("loop: missing '{'");
+                    std::string_view raw2 = stripLineComment(current.text);
+                    if (!raw2.empty() && raw2.back() == '\r') raw2.remove_suffix(1);
+                    std::size_t b = raw2.find('{');
+                    if (b != std::string_view::npos) {
+                        for (std::size_t i = b + 1; i < raw2.size(); ++i) {
+                            char c = raw2[i];
+                            if (c == '{') depth++;
+                            else if (c == '}') { depth--; if (depth == 0) break; }
+                            body += c;
+                        }
+                        break;
+                    }
+                }
+            }
+            while (depth > 0) {
+                if (!pullLine()) throw std::runtime_error("loop: unterminated body");
+                std::string_view raw2 = current.text;
+                if (!raw2.empty() && raw2.back() == '\r') raw2.remove_suffix(1);
+                std::string_view s2 = stripLineComment(raw2);
+                body += '\n';
+                for (char c : s2) {
+                    if (c == '{') depth++;
+                    else if (c == '}') { depth--; if (depth == 0) break; }
+                    body += c;
+                }
+            }
+
+            int id = nextLoopId++;
+            std::string startLabel = "_loop_start_" + std::to_string(id);
+            std::string endLabel   = "_loop_end_"   + std::to_string(id);
+
+            // Substitute `break` / `continue` at our enclosing-loop scope
+            // (i.e. not inside a nested `loop {`).  Other braces are
+            // transparent.  String literals and `//` comments are skipped.
+            std::string subBody;
+            subBody.reserve(body.size());
+            std::vector<bool> loopBraces;
+            auto inNestedLoop = [&]() {
+                for (bool b : loopBraces) if (b) return true;
+                return false;
+            };
+            bool inStr = false;
+            for (std::size_t i = 0; i < body.size(); ) {
+                char c = body[i];
+                if (inStr) {
+                    subBody += c;
+                    if (c == '\\' && i + 1 < body.size()) { subBody += body[i + 1]; i += 2; continue; }
+                    if (c == '"') inStr = false;
+                    ++i; continue;
+                }
+                if (c == '"') { inStr = true; subBody += c; ++i; continue; }
+                if (c == '/' && i + 1 < body.size() && body[i + 1] == '/') {
+                    while (i < body.size() && body[i] != '\n') { subBody += body[i++]; }
+                    continue;
+                }
+                if (c == '{') {
+                    // Detect `loop {` by looking back at the preceding token.
+                    std::size_t e = i;
+                    while (e > 0 && (body[e - 1] == ' ' || body[e - 1] == '\t'
+                                  || body[e - 1] == '\n' || body[e - 1] == '\r')) --e;
+                    bool isLoopBrace = false;
+                    if (e >= 4 && body.compare(e - 4, 4, "loop") == 0
+                        && (e == 4 || !isIdentCont(body[e - 5]))) {
+                        isLoopBrace = true;
+                    }
+                    loopBraces.push_back(isLoopBrace);
+                    subBody += c;
+                    ++i; continue;
+                }
+                if (c == '}') {
+                    if (!loopBraces.empty()) loopBraces.pop_back();
+                    subBody += c;
+                    ++i; continue;
+                }
+                if (isIdentStart(c)) {
+                    std::size_t j = i;
+                    while (j < body.size() && isIdentCont(body[j])) ++j;
+                    std::string_view tok = std::string_view{body}.substr(i, j - i);
+                    bool leftOk = (i == 0) || !isIdentCont(body[i - 1]);
+                    if (leftOk && !inNestedLoop()) {
+                        if (tok == "break") {
+                            subBody += "goto ";
+                            subBody += endLabel;
+                            i = j;
+                            continue;
+                        }
+                        if (tok == "continue") {
+                            subBody += "goto ";
+                            subBody += startLabel;
+                            i = j;
+                            continue;
+                        }
+                    }
+                    subBody.append(tok);
+                    i = j;
+                    continue;
+                }
+                subBody += c;
+                ++i;
+            }
+
+            // Push: start-label, body lines, back-edge goto, end-label.
+            // Body lines are split on newlines (one statement per line is the
+            // canonical form produced by the beautifier and used everywhere).
+            std::vector<std::string> expanded;
+            expanded.push_back(startLabel + ":");
+            std::size_t st = 0;
+            for (std::size_t k = 0; k <= subBody.size(); ++k) {
+                if (k == subBody.size() || subBody[k] == '\n') {
+                    std::string_view piece = trim(std::string_view{subBody}.substr(st, k - st));
+                    if (!piece.empty()) expanded.emplace_back(piece);
+                    st = k + 1;
+                }
+            }
+            expanded.push_back("goto " + startLabel + ";");
+            expanded.push_back(endLabel + ":");
+
+            for (auto it = expanded.rbegin(); it != expanded.rend(); ++it) {
+                pendingLines.push_front(PendingLine{std::move(*it), originFile, originLine});
+            }
+            continue;
         }
 
         // `for <ident> in [<vals>] { <body> }`   -- explicit list

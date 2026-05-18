@@ -1137,6 +1137,355 @@ void beautifyLearnMoves(std::vector<DecodedInstr>& stmts,
     stmts = std::move(out);
 }
 
+bool isAsciiIdentCont(char c) {
+    return c == '_' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+// Pull every same-section `L_<4hex>` label reference out of `body` (in source
+// order).  Skips matches preceded by `<ident>.` (those are cross-section
+// references like `OtherSec.L_0042`) and matches inside identifier runs.
+void collectSameSecLabelRefs(std::string_view body, std::vector<int>& out) {
+    std::size_t i = 0;
+    while (i + 6 <= body.size()) {
+        if (body[i] != 'L' || body[i + 1] != '_') { ++i; continue; }
+        if (i >= 1 && body[i - 1] == '.') { i += 6; continue; }
+        if (i >= 1 && isAsciiIdentCont(body[i - 1])) { ++i; continue; }
+        bool ok = true;
+        int off = 0;
+        for (int k = 0; k < 4; ++k) {
+            char c = body[i + 2 + k];
+            if (c >= '0' && c <= '9') off = off * 16 + (c - '0');
+            else if (c >= 'a' && c <= 'f') off = off * 16 + (c - 'a' + 10);
+            else { ok = false; break; }
+        }
+        if (!ok) { ++i; continue; }
+        if (i + 6 < body.size() && isAsciiIdentCont(body[i + 6])) { i += 6; continue; }
+        out.push_back(off);
+        i += 6;
+    }
+}
+
+// Body is exactly `goto L_<4hex>` (no semicolon -- the serializer adds it),
+// and the hex value matches targetOff.
+bool isUnconditionalGotoTo(std::string_view body, int targetOff) {
+    if (body.size() != 11) return false;
+    if (body.compare(0, 7, "goto L_") != 0) return false;
+    int v = 0;
+    for (int k = 0; k < 4; ++k) {
+        char c = body[7 + k];
+        if (c >= '0' && c <= '9') v = v * 16 + (c - '0');
+        else if (c >= 'a' && c <= 'f') v = v * 16 + (c - 'a' + 10);
+        else return false;
+    }
+    return v == targetOff;
+}
+
+// Replace every `goto L_<4hex>` token in `body` (with the given target hex)
+// by `kw`.  String-aware; word-boundary aware on both sides.
+std::string rewriteGotoToKeyword(std::string_view body, int targetOff,
+                                 std::string_view kw) {
+    char hex[5];
+    for (int k = 0; k < 4; ++k) {
+        int d = (targetOff >> ((3 - k) * 4)) & 0xf;
+        hex[k] = static_cast<char>(d < 10 ? '0' + d : 'a' + d - 10);
+    }
+    hex[4] = '\0';
+    std::string out;
+    out.reserve(body.size());
+    bool inStr = false;
+    std::size_t i = 0;
+    while (i < body.size()) {
+        char c = body[i];
+        if (inStr) {
+            out += c;
+            if (c == '\\' && i + 1 < body.size()) { out += body[i + 1]; i += 2; continue; }
+            if (c == '"') inStr = false;
+            ++i;
+            continue;
+        }
+        if (c == '"') { inStr = true; out += c; ++i; continue; }
+        if (i + 11 <= body.size()
+            && body.compare(i, 7, "goto L_") == 0
+            && (i == 0 || !isAsciiIdentCont(body[i - 1]))
+            && body[i + 7] == hex[0] && body[i + 8] == hex[1]
+            && body[i + 9] == hex[2] && body[i + 10] == hex[3]
+            && (i + 11 == body.size() || !isAsciiIdentCont(body[i + 11]))) {
+            out.append(kw);
+            i += 11;
+            continue;
+        }
+        out += c;
+        ++i;
+    }
+    return out;
+}
+
+// Recognize the classic `Lx: ...; goto Lx; Ly:` (or `; goto Lx;` with no
+// successor label) pattern and rewrite it as `loop { ... }` with `break;` /
+// `continue;` in place of the internal `goto Ly;` and mid-body `goto Lx;`.
+// Conservative: when a label is referenced from outside the recognized block
+// (same-section out-of-range OR cross-section), the label is preserved
+// rather than dropped, and the loop wraps around it -- still byte-identical
+// on reassembly because the synthetic loop labels resolve to the same
+// in-section offset as the user-visible label.
+//
+// Returns true when at least one loop was rewritten.
+bool beautifyLoopsOnce(std::vector<DecodedInstr>& stmts,
+                       std::unordered_set<int>& secLabels,
+                       const std::unordered_set<int>& crossSecRefs) {
+    std::unordered_map<int, std::vector<std::size_t>> sameSecRefs;
+    for (std::size_t k = 0; k < stmts.size(); ++k) {
+        std::vector<int> refs;
+        collectSameSecLabelRefs(stmts[k].body, refs);
+        for (int off : refs) sameSecRefs[off].push_back(k);
+    }
+
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size() + 4);
+    bool changed = false;
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        int oxOff = static_cast<int>(stmts[i].offset);
+
+        std::size_t backEdge = SIZE_MAX;
+        if (oxOff != 0 && secLabels.count(oxOff)) {
+            auto refsIt = sameSecRefs.find(oxOff);
+            if (refsIt != sameSecRefs.end()) {
+                for (auto k : refsIt->second) {
+                    if (k > i && isUnconditionalGotoTo(stmts[k].body, oxOff)) {
+                        backEdge = k;
+                    }
+                }
+            }
+        }
+
+        if (backEdge != SIZE_MAX) {
+            // External-ref test for the loop head.
+            bool oxExternal = crossSecRefs.count(oxOff) > 0;
+            if (!oxExternal) {
+                for (auto k : sameSecRefs[oxOff]) {
+                    if (k < i || k > backEdge) { oxExternal = true; break; }
+                }
+            }
+
+            int oyOff = -1;
+            if (backEdge + 1 < stmts.size()) {
+                int next = static_cast<int>(stmts[backEdge + 1].offset);
+                if (secLabels.count(next)) oyOff = next;
+            }
+            bool oyExternal = false;
+            if (oyOff != -1) {
+                oyExternal = crossSecRefs.count(oyOff) > 0;
+                if (!oyExternal) {
+                    auto oyRefsIt = sameSecRefs.find(oyOff);
+                    if (oyRefsIt != sameSecRefs.end()) {
+                        for (auto k : oyRefsIt->second) {
+                            if (k < i || k > backEdge) { oyExternal = true; break; }
+                        }
+                    }
+                }
+            }
+
+            // Emit the rewritten block.
+            out.push_back({stmts[i].offset, 0, "loop {"});
+            for (std::size_t k = i; k < backEdge; ++k) {
+                std::string nb = rewriteGotoToKeyword(stmts[k].body, oxOff, "continue");
+                if (oyOff != -1) {
+                    nb = rewriteGotoToKeyword(nb, oyOff, "break");
+                }
+                out.push_back({stmts[k].offset, stmts[k].consumed, std::move(nb)});
+            }
+            out.push_back({stmts[backEdge].offset, stmts[backEdge].consumed, "}"});
+
+            if (!oxExternal) secLabels.erase(oxOff);
+            if (oyOff != -1 && !oyExternal) secLabels.erase(oyOff);
+
+            changed = true;
+            i = backEdge + 1;
+            continue;
+        }
+
+        out.push_back(stmts[i]);
+        ++i;
+    }
+    stmts = std::move(out);
+    return changed;
+}
+
+// Pull the value of named arg `name:` from a parsed call's arg list, e.g.
+// `move(entity: 5, to: (0, 0), sprint: 1)` -> getNamedArg(args, "entity") == "5".
+// Returns an empty view if the arg isn't present.  String/bracket-aware so
+// inner colons or commas don't confuse the split.
+std::string_view getNamedArg(const std::vector<std::string_view>& args,
+                             std::string_view name) {
+    for (auto a : args) {
+        std::size_t colon = std::string_view::npos;
+        int depth = 0;
+        bool inStr = false;
+        for (std::size_t k = 0; k < a.size(); ++k) {
+            char c = a[k];
+            if (inStr) {
+                if (c == '\\' && k + 1 < a.size()) { ++k; continue; }
+                if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '(' || c == '[' || c == '{') ++depth;
+            else if (c == ')' || c == ']' || c == '}') --depth;
+            else if (depth == 0 && c == ':') { colon = k; break; }
+        }
+        if (colon == std::string_view::npos) continue;
+        auto n = a.substr(0, colon);
+        while (!n.empty() && (n.front() == ' ' || n.front() == '\t')) n.remove_prefix(1);
+        while (!n.empty() && (n.back()  == ' ' || n.back()  == '\t')) n.remove_suffix(1);
+        if (n != name) continue;
+        auto v = a.substr(colon + 1);
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
+        while (!v.empty() && (v.back()  == ' ' || v.back()  == '\t')) v.remove_suffix(1);
+        return v;
+    }
+    return {};
+}
+
+// Match `(X, Y)`.  Returns (X, Y) trimmed; both empty on mismatch.
+std::pair<std::string_view, std::string_view> matchPairLiteral(std::string_view v) {
+    if (v.size() < 2 || v.front() != '(' || v.back() != ')') return {};
+    auto inner = v.substr(1, v.size() - 2);
+    std::size_t comma = std::string_view::npos;
+    int depth = 0;
+    bool inStr = false;
+    for (std::size_t k = 0; k < inner.size(); ++k) {
+        char c = inner[k];
+        if (inStr) { if (c == '"') inStr = false; continue; }
+        if (c == '"') { inStr = true; continue; }
+        if (c == '(' || c == '[') ++depth;
+        else if (c == ')' || c == ']') --depth;
+        else if (depth == 0 && c == ',') { comma = k; break; }
+    }
+    if (comma == std::string_view::npos) return {};
+    auto x = inner.substr(0, comma);
+    auto y = inner.substr(comma + 1);
+    while (!x.empty() && (x.front() == ' ' || x.front() == '\t')) x.remove_prefix(1);
+    while (!x.empty() && (x.back()  == ' ' || x.back()  == '\t')) x.remove_suffix(1);
+    while (!y.empty() && (y.front() == ' ' || y.front() == '\t')) y.remove_prefix(1);
+    while (!y.empty() && (y.back()  == ' ' || y.back()  == '\t')) y.remove_suffix(1);
+    return {x, y};
+}
+
+// Collapse the canonical NPC-approach routine into `approach(...)`.
+// The 11-stmt window:
+//   [0]  loop {
+//   [1]  move(entity: W, to: (X, Y), sprint: 1)
+//   [2]  if (pstat[101] >= TRIES) break
+//   [3]  addPStat(101, 1)
+//   [4]  delay(WAIT)
+//   [5]  look(entity: Entity.Player, at: W)
+//   [6]  look(entity: Entity.Partner, at: W)
+//   [7]  }
+//   [8]  waitForEntity(W)
+//   [9]  unloadEntity(W)
+//   [10] setPStat(101, 0)
+// Same W in 5 positions; sprint must be 1.  Variants (sprint:0, compound
+// break conditions, ...) stay as raw loops.  No label may sit inside the
+// collapsed window past the loop head -- its offset is shared with stmt[0]
+// and stays attached on serialization.
+void beautifyApproach(std::vector<DecodedInstr>& stmts,
+                      const std::unordered_set<int>& labelOffsets) {
+    constexpr std::size_t N = 11;
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size());
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        bool matched = false;
+        do {
+            if (i + N > stmts.size()) break;
+            if (stmts[i].body     != "loop {")              break;
+            if (stmts[i + 7].body != "}")                   break;
+            // pstat[101] is sometimes bound symbolically in the project's
+            // symbol table (e.g. PStat.LoopIterator), so addPStat/setPStat
+            // can render either form.
+            const auto& incBody = stmts[i + 3].body;
+            if (incBody != "addPStat(101, 1)" &&
+                incBody != "addPStat(PStat.LoopIterator, 1)") break;
+            const auto& rstBody = stmts[i + 10].body;
+            if (rstBody != "setPStat(101, 0)" &&
+                rstBody != "setPStat(PStat.LoopIterator, 0)") break;
+
+            // Bail if any internal stmt has its own label (would be lost
+            // on collapse).  stmt[i+1] shares offset with the loop-open
+            // marker and is already covered by stmt[i]'s rendering.
+            bool labelInMiddle = false;
+            for (std::size_t k = i + 2; k <= i + 10; ++k) {
+                if (labelOffsets.count(static_cast<int>(stmts[k].offset))) {
+                    labelInMiddle = true; break;
+                }
+            }
+            if (labelInMiddle) break;
+
+            auto cMove = parseSimpleCall(stmts[i + 1].body);
+            if (!cMove || cMove->mnemonic != "move") break;
+            auto whoMove = getNamedArg(cMove->args, "entity");
+            auto toMove  = getNamedArg(cMove->args, "to");
+            auto sprMove = getNamedArg(cMove->args, "sprint");
+            if (whoMove.empty() || toMove.empty() || sprMove != "1") break;
+            auto xy = matchPairLiteral(toMove);
+            if (xy.first.empty() || xy.second.empty()) break;
+
+            std::string_view ifb = stmts[i + 2].body;
+            constexpr std::string_view ifPre = "if (pstat[101] >= ";
+            constexpr std::string_view ifSuf = ") break";
+            if (ifb.size() <= ifPre.size() + ifSuf.size()) break;
+            if (ifb.compare(0, ifPre.size(), ifPre) != 0) break;
+            if (ifb.compare(ifb.size() - ifSuf.size(), ifSuf.size(), ifSuf) != 0) break;
+            auto triesVal = ifb.substr(ifPre.size(),
+                                       ifb.size() - ifPre.size() - ifSuf.size());
+
+            auto cDelay = parseSimpleCall(stmts[i + 4].body);
+            if (!cDelay || cDelay->mnemonic != "delay" || cDelay->args.size() != 1) break;
+            auto waitVal = cDelay->args[0];
+
+            auto cLookP = parseSimpleCall(stmts[i + 5].body);
+            if (!cLookP || cLookP->mnemonic != "look") break;
+            if (getNamedArg(cLookP->args, "entity") != "Entity.Player") break;
+            if (getNamedArg(cLookP->args, "at") != whoMove) break;
+
+            auto cLookQ = parseSimpleCall(stmts[i + 6].body);
+            if (!cLookQ || cLookQ->mnemonic != "look") break;
+            if (getNamedArg(cLookQ->args, "entity") != "Entity.Partner") break;
+            if (getNamedArg(cLookQ->args, "at") != whoMove) break;
+
+            auto cWait = parseSimpleCall(stmts[i + 8].body);
+            if (!cWait || cWait->mnemonic != "waitForEntity" || cWait->args.size() != 1) break;
+            if (cWait->args[0] != whoMove) break;
+
+            auto cUnload = parseSimpleCall(stmts[i + 9].body);
+            if (!cUnload || cUnload->mnemonic != "unloadEntity" || cUnload->args.size() != 1) break;
+            if (cUnload->args[0] != whoMove) break;
+
+            // Build the collapsed `approach(...)` call.  String views are
+            // into stmts[i..i+10]; copy now since we're about to replace
+            // those stmts.
+            std::string body = "approach(who: ";
+            body.append(whoMove);
+            body += ", x: ";  body.append(xy.first);
+            body += ", y: ";  body.append(xy.second);
+            body += ", tries: "; body.append(triesVal);
+            body += ", wait: ";  body.append(waitVal);
+            body += ')';
+
+            std::size_t consumed = 0;
+            for (std::size_t k = i; k < i + N; ++k) consumed += stmts[k].consumed;
+            out.push_back({stmts[i].offset, consumed, std::move(body)});
+            i += N;
+            matched = true;
+        } while (false);
+        if (matched) continue;
+        out.push_back(stmts[i]);
+        ++i;
+    }
+    stmts = std::move(out);
+}
+
 // True when `body` contains a top-level named-arg form (`key: value`).
 bool bodyHasNamedArg(std::string_view body) {
     auto cb = parseSimpleCall(body);
@@ -1170,10 +1519,6 @@ bool bodyHasNamedArg(std::string_view body) {
 
 // Per-section label rename map: in-section offset -> new name (e.g. "L1").
 using LabelRename = std::unordered_map<int, std::string>;
-
-bool isAsciiIdentCont(char c) {
-    return c == '_' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-}
 
 // Walk `body` and rewrite every `L_<4hex>` token using the rename maps.
 // Bare `L_<hex>` resolves against the current section.  When the token is
@@ -1242,35 +1587,64 @@ void serializeSection(std::vector<std::string>& out,
         return;
     }
     bool firstStmt = true;
+    int  lastLabelOff = -1;
+    int  loopDepth = 0;   // # of `loop {` markers currently open
+    auto extraIndent = [&]() -> std::string {
+        std::string s;
+        for (int q = 0; q < loopDepth; ++q) s += INDENT;
+        return s;
+    };
     for (const auto& instr : stmts) {
-        const bool isLabelHere = labelOffsets.count(static_cast<int>(instr.offset));
+        const int curOff = static_cast<int>(instr.offset);
+        // Dedup labels: synthetic loop-opener markers share their offset with
+        // the first body instruction, but the label belongs to one place.
+        const bool isLabelHere = labelOffsets.count(curOff) && curOff != lastLabelOff;
+
+        // Decrement depth BEFORE rendering the synthetic loop-close marker
+        // so the `}` aligns with its matching `loop {`.
+        const bool isLoopClose = (instr.body == "}");
+        if (isLoopClose && loopDepth > 0) --loopDepth;
+
         if (isLabelHere) {
             // Blank line before label to visually separate flow chunks
             // (skip if this is the very first statement in the section).
             if (!firstStmt) out.emplace_back("");
             std::string lab;
-            auto rit = rename[secIdx].find(static_cast<int>(instr.offset));
+            auto rit = rename[secIdx].find(curOff);
             lab = (rit != rename[secIdx].end()) ? rit->second
-                                                : labelInSection(static_cast<int>(instr.offset));
+                                                : labelInSection(curOff);
             lab += ':';
-            out.push_back(std::move(lab));
+            out.push_back(std::move(lab));   // labels stay at column 0
+            lastLabelOff = curOff;
         }
-        std::string text{INDENT};
+        std::string text = extraIndent();
+        text += INDENT;
         text += renameLabelsInBody(instr.body, secIdx, rename, sectionByName);
-        // Block-bodied statements (e.g. `for { ... }`) already end with `}` --
-        // appending `;` produces noise like `};`.  Plain calls always need
+        // Block-bodied statements already carry their own brace -- appending
+        // `;` produces noise like `};` or `loop {;`.  Plain calls always need
         // the terminator.
-        if (text.empty() || text.back() != '}') text += ';';
-        // Multi-line bodies: split on `\n`.  First line keeps the INDENT
-        // prefix from above; subsequent lines come through verbatim and
-        // are expected to carry their own indentation in the body string.
+        if (text.empty() || (text.back() != '}' && text.back() != '{')) text += ';';
+        // Multi-line bodies: split on `\n`.  First line already carries the
+        // outer indent; subsequent lines have their own *relative* indent
+        // baked into the body string, so we shift them by the loop-depth
+        // prefix to keep them aligned with the first line.
         std::size_t start = 0;
+        bool firstLine = true;
+        const std::string shift = extraIndent();
         for (std::size_t k = 0; k <= text.size(); ++k) {
             if (k == text.size() || text[k] == '\n') {
-                out.push_back(text.substr(start, k - start));
+                std::string line = text.substr(start, k - start);
+                if (!firstLine && !shift.empty()) line = shift + line;
+                out.push_back(std::move(line));
                 start = k + 1;
+                firstLine = false;
             }
         }
+
+        // Increment AFTER rendering the synthetic loop-open marker so the
+        // body sits one level deeper than `loop {` itself.
+        if (instr.body == "loop {") ++loopDepth;
+
         firstStmt = false;
     }
     out.emplace_back("}");
@@ -1313,6 +1687,67 @@ ScriptDisasm disasmScript(const Script& script) {
         beautifyRemoveItems(stmts[i], secLabels);  // removeItem runs (uniform count) -> removeItems([...], n)
         beautifyForRanges(stmts[i], secLabels);    // stride-1 same-mnemonic runs
         beautifyForArray(stmts[i], secLabels);     // any varying-one-slot >=3 -> for x in [list]
+    }
+
+    // Pass 1.65: rewrite `Lx: ...; goto Lx; Ly:` goto-cycles as `loop {} break`.
+    // Needs a cross-section refs index so we know when a label is reachable
+    // from outside the candidate block (and therefore can't be dropped).
+    std::vector<std::unordered_set<int>> crossSecRefs(script.sections.size());
+    {
+        std::unordered_map<std::string, std::size_t> nameToIdx;
+        for (std::size_t s = 0; s < script.sections.size(); ++s) {
+            nameToIdx[sectionName(script, script.sections[s])] = s;
+        }
+        for (std::size_t s = 0; s < script.sections.size(); ++s) {
+            for (const auto& instr : stmts[s]) {
+                std::string_view body = instr.body;
+                std::size_t i = 0;
+                while (i + 6 <= body.size()) {
+                    if (body[i] != 'L' || body[i + 1] != '_') { ++i; continue; }
+                    if (i >= 1 && isAsciiIdentCont(body[i - 1]) && body[i - 1] != '.') {
+                        ++i; continue;
+                    }
+                    bool ok = true;
+                    int off = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        char c = body[i + 2 + k];
+                        if (c >= '0' && c <= '9') off = off * 16 + (c - '0');
+                        else if (c >= 'a' && c <= 'f') off = off * 16 + (c - 'a' + 10);
+                        else { ok = false; break; }
+                    }
+                    if (!ok) { ++i; continue; }
+                    if (i + 6 < body.size() && isAsciiIdentCont(body[i + 6])) { i += 6; continue; }
+                    // Cross-section if preceded by `<ident>.` with ident found in nameToIdx.
+                    if (i >= 1 && body[i - 1] == '.') {
+                        std::size_t e = i - 1, st = e;
+                        while (st > 0 && isAsciiIdentCont(body[st - 1])) --st;
+                        auto it = nameToIdx.find(std::string{body.substr(st, e - st)});
+                        if (it != nameToIdx.end() && it->second != s) {
+                            crossSecRefs[it->second].insert(off);
+                        }
+                    }
+                    i += 6;
+                }
+            }
+        }
+    }
+    for (std::size_t i = 0; i < script.sections.size(); ++i) {
+        auto& secLabels = labels[i];  // mutable; beautifyLoops may erase entries
+        // Single pass: process sequential outermost loops only.  Iterating
+        // would let a later pass cross the boundary of an already-rewritten
+        // loop (when an internal label has a back-edge from outside that
+        // earlier rewrite), producing tangled overlapping `loop {}` blocks.
+        beautifyLoopsOnce(stmts[i], secLabels, crossSecRefs[i]);
+    }
+
+    // Pass 1.7: fold the canonical NPC-approach routine (loop + trailing
+    // wait/unload/reset triple) into `approach(...)`.  Runs after the loop
+    // beautifier since it pattern-matches against `loop {` / `}` markers.
+    for (std::size_t i = 0; i < script.sections.size(); ++i) {
+        const auto labIt = labels.find(i);
+        const std::unordered_set<int> empty;
+        const auto& secLabels = (labIt == labels.end()) ? empty : labIt->second;
+        beautifyApproach(stmts[i], secLabels);
     }
 
     // Pass 1.75: assign sequential per-section label names (L1, L2, ...) in
