@@ -61,6 +61,11 @@ Script parseScript(int index,
             const auto& e = raw[i];
             const bool isLast = (i == raw.size() - 2);
             const u16 secEnd = isLast ? static_cast<u16>(extent) : raw[i + 1].offset;
+            // Catch garbage entry tables before std::vector::assign() panics
+            // on a negative range (manifests as "vector larger than max_size").
+            if (secEnd < e.offset || secEnd > extent) {
+                throw std::runtime_error("parseScript: non-monotonic or out-of-range section offsets (not a SCNScript?)");
+            }
             const std::size_t absStart = startOffset + e.offset;
             const std::size_t absEnd   = startOffset + secEnd;
             Section sec;
@@ -73,6 +78,24 @@ Script parseScript(int index,
     }
 
     return s;
+}
+
+// DG.SCN container layout (NTSC and PAL):
+//   0x000..0x380 : u32 LE pointer table (first pointer >= 0x800)
+//   0x380..0x800 : 36 x 32-byte filename slots, populated entries start with '\'
+//   0x800..      : script payloads
+//
+// A standalone SCNScript starts with `u16 header, {u16 id, u16 offset}...`,
+// so a u32-aligned 0x800 in the first 4 bytes plus a backslash in the
+// filename region is a near-zero false-positive signal.
+bool looksLikeDGContainer(std::span<const u8> b) {
+    if (b.size() < 0x800) return false;
+    const u32 p0 = readU32(b, 0);
+    if (p0 < 0x800 || p0 > b.size()) return false;
+    for (std::size_t off = 0x380; off + 32 <= 0x800; off += 32) {
+        if (b[off] == 0x5c /* '\\' */) return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -179,8 +202,8 @@ ScriptContainer parseDG(const std::filesystem::path& path, std::size_t numberScr
 }
 
 ScriptContainer parseContainer(const std::filesystem::path& path) {
-    std::string name = toUpperAscii(basename(path));
-    if (name == "DG.SCN") return parseDG(path);
+    auto bytes = readFileBytes(path);
+    if (looksLikeDGContainer(bytes)) return parseDG(path);
     return parseMaphead(path);
 }
 

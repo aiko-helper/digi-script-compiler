@@ -62,7 +62,8 @@ ScriptContainer parseMaphead(const std::filesystem::path& path);
 // Parse DG.SCN -- `numberScripts` u32 pointers, `numberScripts - 1` scripts.
 ScriptContainer parseDG(const std::filesystem::path& path, std::size_t numberScripts = 224);
 
-// Auto-dispatch by filename: "DG.SCN" -> parseDG; otherwise parseMaphead.
+// Auto-dispatch by content sniff: DG-container layout -> parseDG,
+// otherwise parseMaphead.  Lets the file be named anything.
 ScriptContainer parseContainer(const std::filesystem::path& path);
 
 } // namespace dd
