@@ -13,7 +13,7 @@ struct KindBinding {
     SymKind kind;
 };
 
-const std::array<KindBinding, 9> kKindTable = {{
+const std::array<KindBinding, 10> kKindTable = {{
     { "entities",   "Entity",    SymKind::Entity    },
     { "digimon",    "Digimon",   SymKind::Digimon   },
     { "items",      "Item",      SymKind::Item      },
@@ -23,6 +23,7 @@ const std::array<KindBinding, 9> kKindTable = {{
     { "maps",       "Map",       SymKind::Map       },
     { "triggers",   "Trigger",   SymKind::Trigger   },
     { "pstat",      "PStat",     SymKind::PStat     },
+    { "animations", "Animation", SymKind::Animation },
 }};
 
 // (mnemonic, fieldName) -> kind table.  Only listed pairs are symbolized.
@@ -53,6 +54,7 @@ const FieldBinding kFieldTable[] = {
     { "entityWalkToEntityWithCamera", "target", SymKind::Entity },
     { "entityWalkToWithCamera",       "entity", SymKind::Entity },
     { "playAnimation",       "entity",      SymKind::Entity },
+    { "playAnimation",       "animation",   SymKind::Animation },
     { "setAutotalk",         "entity",      SymKind::Entity },
     { "moveEntityTo",        "entity",      SymKind::Entity },
     { "moveEntityToAxis",    "entity",      SymKind::Entity },

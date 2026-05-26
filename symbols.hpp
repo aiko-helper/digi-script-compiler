@@ -22,6 +22,9 @@ enum class SymKind {
     Entity, Digimon, Item, Move, Stat, Condition, Map,
     Trigger,    // setTrigger / unsetTrigger / trigger() / !trigger()
     PStat,      // pstat[N] and the .pstat fields of many opcodes
+    Animation,  // playAnimation `a` slot; empty entity table for now -- exists
+                // so function defs can annotate `a: Animation` even before the
+                // ID catalog is populated.
 };
 
 // Render kind as it appears in source: "Entity", "Digimon", ...

@@ -706,6 +706,7 @@ symbols {
   pstat {
     LoopIterator = 101;
     SavedTime = 105;
+    RollScratch = 110;
     LastBiyomonChaseLocation = 112;
   }
 }

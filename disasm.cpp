@@ -1,7 +1,9 @@
 #include "disasm.hpp"
 #include "char-map.hpp"
+#include "common.hpp"
 #include "custom-ops.hpp"
 #include "opcodes.hpp"
+#include "predicate_neg.hpp"
 #include "symbols.hpp"
 #include "targets.hpp"
 
@@ -83,7 +85,13 @@ std::vector<FieldArg> extractFieldArgs(const FixedOpcode& def,
                 text += '.';
                 text += name;
             } else {
-                text = toDec(static_cast<long long>(val));
+                // Unnamed but kinded: emit `Kind(N)` so the type is still
+                // visible in the source.  The assembler parses this back to
+                // the same int via parseNumOrSym's `Kind(N)` rule.
+                text = std::string{symKindLabel(*sk)};
+                text += '(';
+                text += toDec(static_cast<long long>(val));
+                text += ')';
             }
         } else {
             text = toDec(static_cast<long long>(val));
@@ -471,6 +479,1248 @@ std::optional<int> tryParseInt(std::string_view s) {
     return v * sign;
 }
 
+// ============================================================================
+// Composite catalog -- functions.dgs as the macro definition source.
+//
+// Every "composite" function in functions.dgs (body is more than a single
+// raw(...) call) defines a forward inlining shape; the assembler textually
+// substitutes parameters into the body at invocation.
+//
+// genericBeautifyComposites is the inverse: it walks the catalog, tries each
+// composite's body shape as a window against the decoded stream, and rewrites
+// a successful match to the composite's named call.  This replaces a long
+// series of bespoke per-shape beautifyX functions.
+// ============================================================================
+
+bool compIsIdentStart(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+bool compIsIdentCont(char c) {
+    return compIsIdentStart(c) || (c >= '0' && c <= '9');
+}
+std::string_view compLeadingIdent(std::string_view s) {
+    if (s.empty() || !compIsIdentStart(s[0])) return {};
+    std::size_t n = 1;
+    while (n < s.size() && compIsIdentCont(s[n])) ++n;
+    return s.substr(0, n);
+}
+std::string_view compStripLineComment(std::string_view line) {
+    bool inStr = false;
+    for (std::size_t i = 0; i + 1 < line.size(); ++i) {
+        char c = line[i];
+        if (inStr) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') { inStr = true; continue; }
+        if (c == '/' && line[i + 1] == '/') return line.substr(0, i);
+    }
+    return line;
+}
+std::size_t compFindMatchingRparen(std::string_view s, std::size_t lparen) {
+    int depth = 0;
+    bool inStr = false;
+    for (std::size_t i = lparen; i < s.size(); ++i) {
+        char c = s[i];
+        if (inStr) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') { inStr = true; continue; }
+        if (c == '(') depth++;
+        else if (c == ')') { depth--; if (depth == 0) return i; }
+    }
+    return std::string_view::npos;
+}
+std::vector<std::string_view> compSplitTopCommas(std::string_view s) {
+    std::vector<std::string_view> out;
+    std::size_t start = 0;
+    int depth = 0;
+    bool inStr = false;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (inStr) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') { inStr = true; continue; }
+        if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') depth--;
+        else if (depth == 0 && c == ',') {
+            out.push_back(trim(s.substr(start, i - start)));
+            start = i + 1;
+        }
+    }
+    std::string_view tail = trim(s.substr(start));
+    if (!tail.empty() || !out.empty()) out.push_back(tail);
+    return out;
+}
+std::vector<std::string_view> compSplitTopSemis(std::string_view s) {
+    std::vector<std::string_view> out;
+    std::size_t start = 0;
+    int depth = 0;
+    bool inStr = false;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (inStr) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') { inStr = true; continue; }
+        if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') depth--;
+        else if (depth == 0 && c == ';') {
+            std::string_view t = trim(s.substr(start, i - start));
+            if (!t.empty()) out.push_back(t);
+            start = i + 1;
+        }
+    }
+    std::string_view tail = trim(s.substr(start));
+    if (!tail.empty()) out.push_back(tail);
+    return out;
+}
+
+// Extract `name: value` -> {name, value}, or {"", whole} when no colon.
+struct NamedArg { std::string fieldName; std::string value; };
+NamedArg compSplitNamedArg(std::string_view arg) {
+    arg = trim(arg);
+    auto pos = arg.find(':');
+    if (pos == std::string_view::npos) return { "", std::string{arg} };
+    auto isIdent = [](std::string_view s) {
+        if (s.empty() || !compIsIdentStart(s[0])) return false;
+        for (char c : s) if (!compIsIdentCont(c)) return false;
+        return true;
+    };
+    std::string_view left  = trim(arg.substr(0, pos));
+    std::string_view right = trim(arg.substr(pos + 1));
+    if (!isIdent(left)) return { "", std::string{arg} };
+    return { std::string{left}, std::string{right} };
+}
+
+struct CompArg {
+    std::string fieldName;   // "" if positional
+    std::string value;       // arg value text after any "name:" prefix
+    int paramIdx = -1;       // -1 = literal; >= 0 = composite param index
+};
+
+// A single item in a composite (function) body.
+//
+// Three shapes, mutually exclusive:
+//   - flat call: `mnemonic(args)` -- the original v1 form.  isReturn=isIfBlock=false.
+//   - `return`:  isReturn=true.
+//   - `if (cond) { body }`: isIfBlock=true.  condTokens is the tokenized template
+//     for the predicate (param names may appear as tokens, bound at match time);
+//     body is the (recursive) list of items inside the if's braces.
+struct CompItem {
+    bool isReturn = false;
+    bool isIfBlock = false;
+    std::string mnemonic;          // when flat call
+    std::vector<CompArg> args;     // when flat call
+    std::vector<std::string> condTokens;   // when isIfBlock
+    std::vector<CompItem> body;            // when isIfBlock
+};
+
+struct Composite {
+    std::string name;
+    std::vector<std::string> paramNames;
+    std::vector<bool> paramPreferNamed;  // emit with `name:` prefix at call site
+    // Per-param kind (from `name: Kind` / `name: Kind[]` annotations).
+    // When set, the fold-emit step renders matched bindings as `Kind.Name`
+    // (or `Kind(N)` for unnamed values) instead of bare ints -- mirroring
+    // the rendering of fixed opcodes.
+    std::vector<std::optional<SymKind>> paramKinds;
+    // Per-param default-expr text (from `name: Kind = <expr>`).  When the
+    // matched binding numerically equals the default AND every later param
+    // is also being dropped, the emit step omits it from the call.
+    std::vector<std::optional<std::string>> paramDefaults;
+    std::vector<CompItem> items;
+};
+
+// Find which composite param (if any) this raw arg-text refers to.
+int findParamIdx(std::string_view value,
+                 const std::vector<std::string>& paramNames) {
+    for (std::size_t k = 0; k < paramNames.size(); ++k) {
+        if (value == paramNames[k]) return static_cast<int>(k);
+    }
+    return -1;
+}
+
+// Resolve a symbolic token (`:Name` or `Kind.Name`) to its integer value via
+// the global symbol table.  Returns nullopt for plain ints, unknown names, or
+// `:Name` collisions across kinds.  Used so template tokens like
+// `pstat[:RollScratch]` match concrete `pstat[110]` from disasm output.
+std::optional<int> tryResolveSymbolicToken(std::string_view tok) {
+    if (tok.empty()) return std::nullopt;
+    if (tok[0] == ':') {
+        std::string_view name = tok.substr(1);
+        if (name.empty()) return std::nullopt;
+        static constexpr SymKind kAll[] = {
+            SymKind::Entity, SymKind::Digimon, SymKind::Item, SymKind::Move,
+            SymKind::Stat, SymKind::Condition, SymKind::Map,
+            SymKind::Trigger, SymKind::PStat, SymKind::Animation,
+        };
+        std::optional<int> hit;
+        for (SymKind k : kAll) {
+            int v;
+            if (symbolTable().tryLookupBareName(k, name, v)) {
+                if (hit && *hit != v) return std::nullopt;  // ambiguous
+                hit = v;
+            }
+        }
+        return hit;
+    }
+    std::size_t dot = tok.find('.');
+    if (dot != std::string_view::npos) {
+        auto k = symKindFromLabel(tok.substr(0, dot));
+        if (!k) return std::nullopt;
+        int v;
+        if (symbolTable().tryLookupBareName(*k, tok.substr(dot + 1), v)) return v;
+    }
+    // `Kind(N)` explicit-cast form: capitalized identifier, then `(int)`.
+    if (tok.size() > 3 && tok.back() == ')'
+        && tok[0] >= 'A' && tok[0] <= 'Z') {
+        std::size_t lp = tok.find('(');
+        if (lp != std::string_view::npos) {
+            // Validate kind label so we don't swallow accidental `Foo(123)`
+            // identifiers; otherwise fall through to nullopt.
+            if (symKindFromLabel(tok.substr(0, lp))) {
+                if (auto v = tryParseInt(tok.substr(lp + 1, tok.size() - lp - 2))) {
+                    return v;
+                }
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+// True when `a` and `b` denote the same integer after symbol resolution.
+// Treats `:RollScratch` == `110` == `PStat.RollScratch` and friends.
+bool tokensNumericallyEqual(std::string_view a, std::string_view b) {
+    auto resolve = [](std::string_view s) -> std::optional<int> {
+        if (auto v = tryParseInt(s)) return v;
+        return tryResolveSymbolicToken(s);
+    };
+    auto av = resolve(a), bv = resolve(b);
+    return av && bv && *av == *bv;
+}
+
+// Tokenize a predicate-atom (or atom-chain) string for template matching.
+// Tokens preserve structure for token-by-token compare:
+//   - identifier: letter/_-led run including digits, `.`, `:` (kind-qualifiers
+//     like `Stat.Offense` and ruby-style `:Sym` stay one token)
+//   - number: digit-led run, with `0x` prefix for hex
+//   - operator: greedy `<=`, `>=`, `==`, `!=`, `&&`, `||`; else single char
+//   - punctuation: `(`, `)`, `[`, `]`, `,`, `+`, `-`, `*`, `/`, `%`
+// Whitespace is separator and dropped.  Unknown chars are skipped silently.
+std::vector<std::string> tokenizePredicate(std::string_view s) {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    auto isIdStart = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    };
+    auto isIdCont = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == ':';
+    };
+    while (i < s.size()) {
+        char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { ++i; continue; }
+        if (c == '<' || c == '>' || c == '=' || c == '!') {
+            std::size_t j = i + 1;
+            if (j < s.size() && s[j] == '=') ++j;
+            out.emplace_back(s.substr(i, j - i));
+            i = j;
+            continue;
+        }
+        if (c == '&' || c == '|') {
+            std::size_t j = i + 1;
+            if (j < s.size() && s[j] == c) ++j;
+            out.emplace_back(s.substr(i, j - i));
+            i = j;
+            continue;
+        }
+        if (c == '(' || c == ')' || c == '[' || c == ']'
+         || c == ',' || c == '+' || c == '-' || c == '*'
+         || c == '/' || c == '%') {
+            out.emplace_back(1, c);
+            ++i;
+            continue;
+        }
+        if (isIdStart(c) || c == ':') {
+            std::size_t j = i + 1;
+            while (j < s.size() && isIdCont(s[j])) ++j;
+            out.emplace_back(s.substr(i, j - i));
+            i = j;
+            continue;
+        }
+        if (c >= '0' && c <= '9') {
+            std::size_t j = i + 1;
+            if (c == '0' && j < s.size() && (s[j] == 'x' || s[j] == 'X')) {
+                ++j;
+                while (j < s.size()) {
+                    char d = s[j];
+                    if ((d >= '0' && d <= '9') || (d >= 'a' && d <= 'f')
+                     || (d >= 'A' && d <= 'F')) ++j;
+                    else break;
+                }
+            } else {
+                while (j < s.size() && s[j] >= '0' && s[j] <= '9') ++j;
+            }
+            out.emplace_back(s.substr(i, j - i));
+            i = j;
+            continue;
+        }
+        ++i;  // unknown -- skip
+    }
+    return out;
+}
+
+// Match a tokenized template predicate against a concrete predicate string,
+// binding param-name tokens to concrete tokens (consistent-binding check).
+//
+// Literal tokens must match string-equal OR numeric-equal (so the template
+// `0x10` matches a concrete `16`).
+bool matchPredicateTemplate(
+        const std::vector<std::string>& templateTokens,
+        std::string_view concrete,
+        std::vector<std::optional<std::string>>& bindings,
+        const std::vector<std::string>& paramNames) {
+    auto concreteToks = tokenizePredicate(concrete);
+    if (concreteToks.size() != templateTokens.size()) return false;
+    for (std::size_t k = 0; k < templateTokens.size(); ++k) {
+        const std::string& tmpl = templateTokens[k];
+        const std::string& got  = concreteToks[k];
+        int pi = findParamIdx(tmpl, paramNames);
+        if (pi >= 0) {
+            if (bindings[pi]) {
+                if (*bindings[pi] != got) return false;
+            } else {
+                bindings[pi] = got;
+            }
+            continue;
+        }
+        if (tmpl == got) continue;
+        // Equality fallback: treat tokens as equal when they denote the same
+        // integer after symbol resolution (so `:RollScratch` matches `110`
+        // and `PStat.RollScratch` matches both).
+        if (tokensNumericallyEqual(tmpl, got)) continue;
+        return false;
+    }
+    return true;
+}
+
+// Translate `raw(opcode, ...)` body item into the disasm-canonical mnemonic
+// call by reading fixedOpcodes() and dropping empty-zero fields (matches
+// extractFieldArgs at disasm.cpp top).  Returns nullopt on unsupported shape.
+std::optional<CompItem> translateRawToMnemonic(
+        const std::vector<std::string_view>& rawArgs,
+        const std::vector<std::string>& paramNames) {
+    if (rawArgs.empty()) return std::nullopt;
+    auto opOpt = tryParseInt(rawArgs[0]);
+    if (!opOpt || *opOpt < 0 || *opOpt > 0xff) return std::nullopt;
+    u8 op = static_cast<u8>(*opOpt);
+    const auto& fx = fixedOpcodes();
+    auto it = fx.find(op);
+    if (it == fx.end()) return std::nullopt;
+    const FixedOpcode& def = it->second;
+    if (rawArgs.size() != 1 + def.fields.size()) return std::nullopt;
+
+    CompItem item;
+    item.mnemonic = std::string{def.mnemonic};
+    for (std::size_t k = 0; k < def.fields.size(); ++k) {
+        const Field& f = def.fields[k];
+        std::string_view a = trim(rawArgs[k + 1]);
+        // s16(x) / s32(x) wrappers -- the inner expression is the actual value.
+        if ((a.size() > 4 && a.substr(0, 4) == "s16(" && a.back() == ')')
+         || (a.size() > 4 && a.substr(0, 4) == "s32(" && a.back() == ')')) {
+            a = trim(a.substr(4, a.size() - 5));
+        }
+        auto v = tryParseInt(a);
+        if (f.n == "empty" && v && *v == 0) continue;
+        CompArg ca;
+        ca.value = std::string{a};
+        ca.paramIdx = findParamIdx(a, paramNames);
+        item.args.push_back(std::move(ca));
+    }
+    return item;
+}
+
+// Forward decl -- the recursive body parser invokes itself for if-block bodies.
+struct ParsedCompBody {
+    std::vector<CompItem> items;
+    bool ok = false;
+};
+ParsedCompBody parseCompBody(std::string_view body,
+                              const std::vector<std::string>& paramNames);
+
+// Parse `mnemonic(args)` into a CompItem (literals/param-refs/named-arg form).
+std::optional<CompItem> parseBodyCall(std::string_view line,
+                                       const std::vector<std::string>& paramNames) {
+    std::string_view t = trim(line);
+    if (t == "return") {
+        CompItem item; item.isReturn = true; return item;
+    }
+    auto lp = t.find('(');
+    if (lp == std::string_view::npos || t.empty() || t.back() != ')') return std::nullopt;
+    std::string_view mn = trim(t.substr(0, lp));
+    std::string_view ident = compLeadingIdent(mn);
+    if (ident.size() != mn.size()) return std::nullopt;
+    std::string_view inside = t.substr(lp + 1, t.size() - lp - 2);
+    auto parts = compSplitTopCommas(inside);
+
+    CompItem item;
+    if (mn == "raw") {
+        auto translated = translateRawToMnemonic(parts, paramNames);
+        if (!translated) return std::nullopt;
+        return translated;
+    }
+    item.mnemonic = std::string{mn};
+    for (auto p : parts) {
+        if (p.empty()) continue;
+        NamedArg na = compSplitNamedArg(p);
+        CompArg ca;
+        ca.fieldName = std::move(na.fieldName);
+        ca.value = std::move(na.value);
+        ca.paramIdx = findParamIdx(ca.value, paramNames);
+        item.args.push_back(std::move(ca));
+    }
+    return item;
+}
+
+// Recursive descent over a function body (or if-block body).  Supports flat
+// `mnemonic(args);` calls AND block-form `if (cond) { body }`.  Still rejects
+// `for`/`loop`/`while`/`do`/`switch` (scope limit -- those have bespoke
+// beautifiers).  Returns `ok=false` when the body has shape we don't model.
+ParsedCompBody parseCompBody(std::string_view body,
+                              const std::vector<std::string>& paramNames) {
+    ParsedCompBody out;
+    auto isWS = [](char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+    auto isIdStart = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    };
+    auto isIdCont = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_';
+    };
+
+    std::size_t i = 0;
+    while (i < body.size()) {
+        while (i < body.size() && (isWS(body[i]) || body[i] == ';')) ++i;
+        if (i >= body.size()) break;
+        if (i + 1 < body.size() && body[i] == '/' && body[i + 1] == '/') {
+            while (i < body.size() && body[i] != '\n') ++i;
+            continue;
+        }
+
+        // Identify leading keyword.  We accept `if (` and reject other
+        // control-flow keywords explicitly.
+        std::size_t kwEnd = i;
+        while (kwEnd < body.size() && isIdCont(body[kwEnd])) ++kwEnd;
+        std::string_view kw = body.substr(i, kwEnd - i);
+        if (kw == "for" || kw == "loop" || kw == "while" || kw == "do" || kw == "switch") {
+            return out;  // ok=false, drop this composite
+        }
+        if (kw == "if") {
+            // Block-form `if (cond) { body }`.  No `else` support in v1.
+            std::size_t lp = kwEnd;
+            while (lp < body.size() && isWS(body[lp])) ++lp;
+            if (lp >= body.size() || body[lp] != '(') return out;
+            std::size_t rp = compFindMatchingRparen(body, lp);
+            if (rp == std::string_view::npos) return out;
+            std::string_view cond = trim(body.substr(lp + 1, rp - lp - 1));
+            std::size_t after = rp + 1;
+            while (after < body.size() && isWS(body[after])) ++after;
+            if (after >= body.size() || body[after] != '{') return out;
+            // Capture body until matching `}`.
+            std::size_t br = after + 1;
+            int depth = 1;
+            std::size_t brEnd = br;
+            while (brEnd < body.size() && depth > 0) {
+                char c = body[brEnd];
+                if (c == '{') ++depth;
+                else if (c == '}') --depth;
+                if (depth > 0) ++brEnd;
+            }
+            if (depth != 0) return out;
+            std::string_view innerBody = body.substr(br, brEnd - br);
+            auto inner = parseCompBody(innerBody, paramNames);
+            if (!inner.ok) return out;
+            CompItem item;
+            item.isIfBlock = true;
+            item.condTokens = tokenizePredicate(cond);
+            item.body = std::move(inner.items);
+            out.items.push_back(std::move(item));
+            i = brEnd + 1;
+            continue;
+        }
+
+        // Otherwise it's a flat statement ending in `;`.  Find the top-level
+        // `;` (paren/bracket-aware, string-aware would be ideal but functions
+        // unlikely contain string literals here).
+        std::size_t semi = i;
+        int parenDepth = 0;
+        while (semi < body.size()) {
+            char c = body[semi];
+            if (c == '(' || c == '[') ++parenDepth;
+            else if (c == ')' || c == ']') --parenDepth;
+            else if (parenDepth == 0 && c == ';') break;
+            else if (parenDepth == 0 && c == '{') return out;  // unexpected nested block
+            ++semi;
+        }
+        std::string_view stmt = trim(body.substr(i, semi - i));
+        if (!stmt.empty()) {
+            auto call = parseBodyCall(stmt, paramNames);
+            if (!call) return out;
+            out.items.push_back(std::move(*call));
+        }
+        i = (semi < body.size()) ? semi + 1 : semi;
+    }
+    (void)isIdStart;
+    out.ok = true;
+    return out;
+}
+
+// Forward decl: defined alongside loadPairLoopsFromDgs below.  Used here so
+// loadCompositesFromDgs() can skip function bodies that match the pair-loop
+// shape and route them to the pair-loop catalog instead.
+std::optional<std::tuple<std::string, std::string, std::string, CompItem>>
+tryParsePairLoopBody(std::string_view body,
+                     const std::vector<std::string>& paramNames);
+
+// Parse functions.dgs.  Skips built-ins (single raw(...) body) and any
+// composite that contains control-flow we can't model.  Each kept composite
+// has its body lowered to a tree of CompItems (flat calls + block-form ifs).
+std::vector<Composite> loadCompositesFromDgs(const std::filesystem::path& path) {
+    std::vector<Composite> out;
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return out;
+    std::string text = readFileText(path);
+
+    std::vector<std::string_view> lines;
+    {
+        std::size_t pos = 0;
+        while (pos <= text.size()) {
+            std::size_t nl = text.find('\n', pos);
+            std::string_view ln = (nl == std::string::npos)
+                ? std::string_view{text}.substr(pos)
+                : std::string_view{text}.substr(pos, nl - pos);
+            if (!ln.empty() && ln.back() == '\r') ln.remove_suffix(1);
+            lines.push_back(ln);
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+    }
+
+    std::size_t i = 0;
+    while (i < lines.size()) {
+        std::string_view raw = compStripLineComment(lines[i]);
+        std::string_view ln  = trim(raw);
+        if (!startsWith(ln, "function")
+            || (ln.size() > 8 && ln[8] != ' ' && ln[8] != '\t')) {
+            ++i; continue;
+        }
+        std::string_view rest = trim(ln.substr(8));
+        std::string_view nameView = compLeadingIdent(rest);
+        if (nameView.empty()) { ++i; continue; }
+        Composite comp;
+        comp.name = std::string{nameView};
+        rest = trim(rest.substr(nameView.size()));
+        if (rest.empty() || rest[0] != '(') { ++i; continue; }
+        std::size_t rp = compFindMatchingRparen(rest, 0);
+        if (rp == std::string_view::npos) { ++i; continue; }
+        for (auto p : compSplitTopCommas(rest.substr(1, rp - 1))) {
+            std::string_view tp = trim(p);
+            if (tp.empty()) continue;
+            // `[PreferNamed]` prefix opts this param into named-arg styling
+            // (`name: value`) at matched call sites.
+            bool preferNamed = false;
+            if (startsWith(tp, "[PreferNamed]")) {
+                preferNamed = true;
+                tp = trim(tp.substr(std::string_view{"[PreferNamed]"}.size()));
+            }
+            // Split off `= <default>` at top level (mirror of the assembler's
+            // param parser).  Skips `==`/`=>`/`!=`/`<=`/`>=` and anything in
+            // nested `[]`/`()`/`{}`.
+            std::optional<std::string> defaultExpr;
+            {
+                int bd = 0, pd = 0, cd = 0;
+                std::size_t eq = std::string_view::npos;
+                for (std::size_t k = 0; k < tp.size(); ++k) {
+                    char c = tp[k];
+                    if (c == '[') ++bd;
+                    else if (c == ']') --bd;
+                    else if (c == '(') ++pd;
+                    else if (c == ')') --pd;
+                    else if (c == '{') ++cd;
+                    else if (c == '}') --cd;
+                    else if (c == '=' && bd == 0 && pd == 0 && cd == 0) {
+                        char nx = (k + 1 < tp.size()) ? tp[k + 1] : '\0';
+                        char pv = (k > 0) ? tp[k - 1] : '\0';
+                        if (nx == '=' || nx == '>' || pv == '=' || pv == '!' || pv == '<' || pv == '>') continue;
+                        eq = k;
+                        break;
+                    }
+                }
+                if (eq != std::string_view::npos) {
+                    defaultExpr = std::string{trim(tp.substr(eq + 1))};
+                    tp = trim(tp.substr(0, eq));
+                }
+            }
+            // `name` or `name: Kind`/`name: Kind[]` -- pull out the name + kind.
+            auto colon = tp.find(':');
+            std::string_view pn = (colon == std::string_view::npos) ? tp
+                                                                    : trim(tp.substr(0, colon));
+            std::optional<SymKind> pkind;
+            if (colon != std::string_view::npos) {
+                std::string_view kt = trim(tp.substr(colon + 1));
+                if (kt.size() >= 2 && kt.substr(kt.size() - 2) == "[]") {
+                    kt = trim(kt.substr(0, kt.size() - 2));
+                }
+                // Array of pairs `(K1, K2)` and the literal `int` marker
+                // both stay un-kinded for fold-render purposes.
+                if (!kt.empty() && kt.front() != '(' && kt != "int") {
+                    pkind = symKindFromLabel(kt);
+                }
+            }
+            comp.paramNames.emplace_back(pn);
+            comp.paramPreferNamed.push_back(preferNamed);
+            comp.paramKinds.push_back(pkind);
+            comp.paramDefaults.push_back(defaultExpr);
+        }
+        // Body starts with `{` on this or a later line; collect until matching `}`.
+        std::string body;
+        std::string_view tail = trim(rest.substr(rp + 1));
+        std::size_t depth = 0;
+        auto consumeChunk = [&](std::string_view chunk) {
+            for (char c : chunk) {
+                if (depth >= 1) body += c;
+                if (c == '{') ++depth;
+                else if (c == '}') {
+                    if (depth == 0) return;
+                    --depth;
+                    if (depth == 0) {
+                        // Drop the closing brace we just appended.
+                        if (!body.empty() && body.back() == '}') body.pop_back();
+                    }
+                }
+            }
+        };
+        consumeChunk(tail);
+        ++i;
+        while (depth > 0 && i < lines.size()) {
+            std::string_view r2 = compStripLineComment(lines[i]);
+            body += '\n';
+            consumeChunk(r2);
+            ++i;
+        }
+
+        // Pair-loop composites (body == `for X, Y in P { call }`) are
+        // captured by loadPairLoopsFromDgs() instead; skip here.
+        if (tryParsePairLoopBody(body, comp.paramNames)) continue;
+
+        // Parse the body recursively (flat calls + block-form ifs).  Drops
+        // composites we can't model (for/loop/while/do/switch, unknown shapes).
+        auto parsed = parseCompBody(body, comp.paramNames);
+        if (!parsed.ok || parsed.items.empty()) continue;
+        comp.items = std::move(parsed.items);
+
+        // Skip built-ins: a single item that is just one raw-call after
+        // translation -- those decode 1:1, no beautification to do.
+        if (comp.items.size() == 1 && !comp.items[0].isIfBlock) continue;
+        out.push_back(std::move(comp));
+    }
+    return out;
+}
+
+
+const std::vector<Composite>& compositeCatalog() {
+    static const std::vector<Composite> cat = loadCompositesFromDgs("functions.dgs");
+    return cat;
+}
+
+// Composite whose body is exactly `for X, Y in P { call(...) }`.  Folds runs
+// of `call(...)` with two slots varying together (one per pair) into the
+// `funcName([X1 => Y1, X2 => Y2, ...], <other params>)` form.
+//
+// Sentinels in innerCall.args[k].paramIdx beyond the normal paramNames range:
+//   kIterAIdx (-10) -- this arg position is bound to the loop's first iter
+//   kIterBIdx (-11) -- bound to the loop's second iter
+struct PairLoopComposite {
+    std::string name;
+    std::vector<std::string> paramNames;
+    std::vector<bool> paramPreferNamed;
+    std::size_t pairsParamIdx = 0;     // index in paramNames
+    bool isPair = false;               // true: 2 iters + `K=>V` form;
+                                       // false: 1 iter + bare-value form
+    CompItem innerCall;
+};
+static constexpr int kIterAIdx = -10;
+static constexpr int kIterBIdx = -11;
+
+// Scan a function body for a single- or double-iter for-loop shape.
+// Returns (iterA, iterB, pairsParam, innerCall) on a match.  iterB is empty
+// for single-iter `for X in P { call }` bodies; non-empty for pair-iter
+// `for X, Y in P { call }`.  paramsForBody is the function's paramNames
+// followed by [iterA] or [iterA, iterB] so findParamIdx can resolve both
+// regular params and iters during parseBodyCall.
+std::optional<std::tuple<std::string, std::string, std::string, CompItem>>
+tryParsePairLoopBody(std::string_view body,
+                     const std::vector<std::string>& paramNames) {
+    // Strip leading/trailing whitespace + the surrounding `for ... { ... }`.
+    auto isWS = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    std::size_t i = 0;
+    while (i < body.size() && isWS(body[i])) ++i;
+    if (body.size() - i < 4 || body.substr(i, 4) != "for ") return std::nullopt;
+    i += 4;
+    while (i < body.size() && isWS(body[i])) ++i;
+    auto isId = [](char c) { return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'; };
+    std::size_t a0 = i;
+    while (i < body.size() && isId(body[i])) ++i;
+    std::string iterA{body.substr(a0, i - a0)};
+    while (i < body.size() && isWS(body[i])) ++i;
+    std::string iterB;
+    if (i < body.size() && body[i] == ',') {
+        ++i;
+        while (i < body.size() && isWS(body[i])) ++i;
+        std::size_t b0 = i;
+        while (i < body.size() && isId(body[i])) ++i;
+        iterB.assign(body.substr(b0, i - b0));
+        while (i < body.size() && isWS(body[i])) ++i;
+    }
+    if (body.size() - i < 3 || body.substr(i, 2) != "in") return std::nullopt;
+    i += 2;
+    while (i < body.size() && isWS(body[i])) ++i;
+    std::size_t p0 = i;
+    while (i < body.size() && isId(body[i])) ++i;
+    std::string pairsParam{body.substr(p0, i - p0)};
+    while (i < body.size() && isWS(body[i])) ++i;
+    if (i >= body.size() || body[i] != '{') return std::nullopt;
+    ++i;
+    // Capture loop body to matching `}` -- assume no nested braces (true for
+    // the intended single-call shape).
+    std::size_t loopBodyStart = i;
+    int depth = 1;
+    while (i < body.size() && depth > 0) {
+        if (body[i] == '{') ++depth;
+        else if (body[i] == '}') { --depth; if (depth == 0) break; }
+        ++i;
+    }
+    if (depth != 0) return std::nullopt;
+    std::string_view inner = body.substr(loopBodyStart, i - loopBodyStart);
+    // After `}` only whitespace should remain.
+    for (std::size_t k = i + 1; k < body.size(); ++k) {
+        if (!isWS(body[k])) return std::nullopt;
+    }
+
+    // Inner must be exactly one statement.
+    std::string innerStr{inner};
+    // Strip trailing `;` and trim.
+    while (!innerStr.empty() && (isWS(innerStr.back()) || innerStr.back() == ';')) {
+        innerStr.pop_back();
+    }
+    // parseBodyCall takes paramNames; include the iters so the args bind.
+    std::vector<std::string> withIters = paramNames;
+    withIters.push_back(iterA);
+    int aIdx = static_cast<int>(paramNames.size());
+    int bIdx = -1;
+    if (!iterB.empty()) {
+        withIters.push_back(iterB);
+        bIdx = aIdx + 1;
+    }
+    auto call = parseBodyCall(innerStr, withIters);
+    if (!call) return std::nullopt;
+    if (call->isReturn || call->isIfBlock) return std::nullopt;
+    // Rewrite paramIdx values that point at the iter slots into the sentinels.
+    for (auto& arg : call->args) {
+        if (arg.paramIdx == aIdx) arg.paramIdx = kIterAIdx;
+        else if (bIdx >= 0 && arg.paramIdx == bIdx) arg.paramIdx = kIterBIdx;
+    }
+    return std::make_tuple(std::move(iterA), std::move(iterB),
+                           std::move(pairsParam), std::move(*call));
+}
+
+// Match one arg value against a template-arg value, with param binding.
+// Handles four cases:
+//   * exact string equality (literal match)
+//   * template is a param ref (`x` in `paramNames`) -- bind it or check
+//     consistency against an earlier binding
+//   * symbolic-numeric equivalence (`PStat(245)` <-> `245`, `:Foo` <-> N, ...)
+//   * tuple decomposition (`(x, y)` vs `(242, -1810)`) -- recurse on each
+//     comma-separated component.  This is what lets `moveCamera(to: (x, y),
+//     ...)` in a composite body fold over concrete tuples in the bytecode.
+bool matchArgValue(const std::string& tmpl,
+                   const std::string& got,
+                   std::vector<std::optional<std::string>>& bindings,
+                   const std::vector<std::string>& paramNames) {
+    if (tmpl == got) return true;
+    int pi = findParamIdx(tmpl, paramNames);
+    if (pi >= 0) {
+        if (bindings[pi]) return *bindings[pi] == got;
+        bindings[pi] = got;
+        return true;
+    }
+    if (tokensNumericallyEqual(tmpl, got)) return true;
+    auto isTuple = [](std::string_view s) {
+        s = trim(s);
+        return s.size() >= 2 && s.front() == '(' && s.back() == ')';
+    };
+    if (isTuple(tmpl) && isTuple(got)) {
+        std::string_view ti = trim(std::string_view{tmpl});
+        std::string_view gi = trim(std::string_view{got});
+        ti = ti.substr(1, ti.size() - 2);
+        gi = gi.substr(1, gi.size() - 2);
+        auto tParts = compSplitTopCommas(ti);
+        auto gParts = compSplitTopCommas(gi);
+        if (tParts.size() != gParts.size()) return false;
+        for (std::size_t k = 0; k < tParts.size(); ++k) {
+            std::string tk{trim(tParts[k])};
+            std::string gk{trim(gParts[k])};
+            if (!matchArgValue(tk, gk, bindings, paramNames)) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+// Re-scan functions.dgs for pair-loop composites.  Mirrors the function-def
+// scaffolding of loadCompositesFromDgs() but captures the iter names and
+// inner-call template instead of dropping the body.
+std::vector<PairLoopComposite> loadPairLoopsFromDgs(const std::filesystem::path& path) {
+    std::vector<PairLoopComposite> out;
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return out;
+    std::string text = readFileText(path);
+    std::vector<std::string_view> lines;
+    {
+        std::size_t pos = 0;
+        while (pos <= text.size()) {
+            std::size_t nl = text.find('\n', pos);
+            std::string_view ln = (nl == std::string::npos)
+                ? std::string_view{text}.substr(pos)
+                : std::string_view{text}.substr(pos, nl - pos);
+            if (!ln.empty() && ln.back() == '\r') ln.remove_suffix(1);
+            lines.push_back(ln);
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+    }
+    std::size_t i = 0;
+    while (i < lines.size()) {
+        std::string_view raw = compStripLineComment(lines[i]);
+        std::string_view ln = trim(raw);
+        if (!startsWith(ln, "function")
+            || (ln.size() > 8 && ln[8] != ' ' && ln[8] != '\t')) {
+            ++i;
+            continue;
+        }
+        std::string_view rest = trim(ln.substr(8));
+        std::string_view nameView = compLeadingIdent(rest);
+        if (nameView.empty()) { ++i; continue; }
+        PairLoopComposite plc;
+        plc.name = std::string{nameView};
+        rest = trim(rest.substr(nameView.size()));
+        if (rest.empty() || rest[0] != '(') { ++i; continue; }
+        std::size_t rp = compFindMatchingRparen(rest, 0);
+        if (rp == std::string_view::npos) { ++i; continue; }
+        // Track the array param position so the fold knows which slot
+        // receives the `[...]` literal (single-iter: bare values; pair-iter:
+        // `K=>V`).  At most one such param per function -- a body iterating
+        // multiple lists isn't a shape we model.
+        std::optional<std::size_t> arrayIdx;
+        bool arrayIsPair = false;
+        std::size_t paramIdxCount = 0;
+        for (auto p : compSplitTopCommas(rest.substr(1, rp - 1))) {
+            std::string_view tp = trim(p);
+            if (tp.empty()) continue;
+            bool preferNamed = false;
+            if (startsWith(tp, "[PreferNamed]")) {
+                preferNamed = true;
+                tp = trim(tp.substr(std::string_view{"[PreferNamed]"}.size()));
+            }
+            auto colon = tp.find(':');
+            std::string_view pn = (colon == std::string_view::npos) ? tp
+                                                                    : trim(tp.substr(0, colon));
+            // Recognize either `Kind[]` (single) or `(K1, K2)[]` (pair).
+            // First array-typed param wins as the iteration target.
+            if (colon != std::string_view::npos) {
+                std::string_view typeT = trim(tp.substr(colon + 1));
+                bool endsArr = typeT.size() >= 2 && typeT.substr(typeT.size() - 2) == "[]";
+                if (endsArr && !arrayIdx) {
+                    arrayIdx = paramIdxCount;
+                    arrayIsPair = !typeT.empty() && typeT.front() == '(';
+                }
+            }
+            plc.paramNames.emplace_back(pn);
+            plc.paramPreferNamed.push_back(preferNamed);
+            ++paramIdxCount;
+        }
+        if (!arrayIdx) { ++i; continue; }
+        plc.pairsParamIdx = *arrayIdx;
+        plc.isPair = arrayIsPair;
+        // Collect body.
+        std::string body;
+        std::string_view tail = trim(rest.substr(rp + 1));
+        std::size_t depth = 0;
+        auto consumeChunk = [&](std::string_view chunk) {
+            for (char c : chunk) {
+                if (depth >= 1) body += c;
+                if (c == '{') ++depth;
+                else if (c == '}') {
+                    if (depth == 0) return;
+                    --depth;
+                    if (depth == 0) {
+                        if (!body.empty() && body.back() == '}') body.pop_back();
+                    }
+                }
+            }
+        };
+        consumeChunk(tail);
+        ++i;
+        while (depth > 0 && i < lines.size()) {
+            std::string_view r2 = compStripLineComment(lines[i]);
+            body += '\n';
+            consumeChunk(r2);
+            ++i;
+        }
+        auto parsed = tryParsePairLoopBody(body, plc.paramNames);
+        if (!parsed) continue;
+        // Iter-count must match the array shape (1 iter <-> Kind[],
+        // 2 iters <-> (K1, K2)[]); skip otherwise.
+        const std::string& iterB = std::get<1>(*parsed);
+        if (plc.isPair != !iterB.empty()) continue;
+        plc.innerCall = std::move(std::get<3>(*parsed));
+        out.push_back(std::move(plc));
+    }
+    return out;
+}
+
+const std::vector<PairLoopComposite>& pairLoopCatalog() {
+    static const std::vector<PairLoopComposite> cat = loadPairLoopsFromDgs("functions.dgs");
+    return cat;
+}
+
+// Render an int back into the most-readable typed-value form (for the
+// `K => V` pair-list emit).  Mirrors the source-arg lookup used by the
+// fixed-opcode renderer: `Kind.Name` if a name binding exists, else
+// `Kind(N)`.  Bare-int fallback when no kind context.
+std::string renderTypedValue(int v, SymKind k) {
+    std::string nm = symbolTable().lookupName(k, v);
+    if (!nm.empty()) {
+        std::string out{symKindLabel(k)};
+        out += '.';
+        out += nm;
+        return out;
+    }
+    std::string out{symKindLabel(k)};
+    out += '(';
+    out += toDec(static_cast<long long>(v));
+    out += ')';
+    return out;
+}
+
+// Try to fold a run of consecutive calls into one PairLoopComposite call.
+// Min run length 2 (a single call doesn't justify the bracket-list ceremony).
+void beautifyPairLoopComposites(std::vector<DecodedInstr>& stmts,
+                                const std::unordered_set<int>& labelOffsets) {
+    const auto& catalog = pairLoopCatalog();
+    if (catalog.empty()) return;
+    std::vector<DecodedInstr> outStmts;
+    outStmts.reserve(stmts.size());
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        std::optional<std::pair<std::string, std::size_t>> best;
+        for (const auto& plc : catalog) {
+            // Tentatively match consecutive stmts against the inner call.
+            std::vector<std::optional<std::string>> bindings(plc.paramNames.size());
+            std::vector<std::pair<std::string, std::string>> pairs;
+            std::size_t j = i;
+            while (j < stmts.size()) {
+                if (j != i && labelOffsets.count(static_cast<int>(stmts[j].offset))) break;
+                auto call = parseSimpleCall(stmts[j].body);
+                if (!call) break;
+                if (call->mnemonic != plc.innerCall.mnemonic) break;
+                if (call->args.size() != plc.innerCall.args.size()) break;
+                std::string itA, itB;
+                bool ok = true;
+                bool sawA = false, sawB = false;
+                auto bindingsTry = bindings;
+                for (std::size_t a = 0; a < plc.innerCall.args.size(); ++a) {
+                    NamedArg gotNA = compSplitNamedArg(call->args[a]);
+                    const auto& want = plc.innerCall.args[a];
+                    if (!want.fieldName.empty() && want.fieldName != gotNA.fieldName) { ok = false; break; }
+                    const std::string& gotVal = gotNA.value;
+                    if (want.paramIdx == kIterAIdx) {
+                        itA = gotVal; sawA = true;
+                    } else if (want.paramIdx == kIterBIdx) {
+                        itB = gotVal; sawB = true;
+                    } else if (want.paramIdx >= 0) {
+                        int pi = want.paramIdx;
+                        if (bindingsTry[pi]) {
+                            if (*bindingsTry[pi] != gotVal) { ok = false; break; }
+                        } else bindingsTry[pi] = gotVal;
+                    } else {
+                        if (!matchArgValue(want.value, gotVal, bindingsTry, plc.paramNames)) { ok = false; break; }
+                    }
+                }
+                if (!ok) break;
+                if (!sawA) break;
+                if (plc.isPair && !sawB) break;
+                bindings = std::move(bindingsTry);
+                pairs.emplace_back(std::move(itA), std::move(itB));
+                ++j;
+            }
+            // Threshold 3 matches beautifyForRanges / beautifyForArray; a
+            // 2-call run reads worse as `setX([A=>1, A=>2], ...)` than as
+            // two plain calls.
+            if (pairs.size() < 3) continue;
+            // When folded, always wrap multi-line -- a 3+ item bracketed
+            // list is hard to scan on a single line.  The renderer prepends
+            // section/loop indent to each subsequent line via extraIndent();
+            // we add the inner INDENTs explicitly here.  All params are
+            // emitted in declaration order; everything except the leading
+            // positional run is named so reordering and skipped slots are
+            // unambiguous to the assembler.
+            std::string body = plc.name;
+            body += "(";
+            bool needComma = false;
+            // Once we emit a named arg, every subsequent arg must also be
+            // named (per the assembler's `positional-after-named` rule).
+            bool forceNamed = false;
+            // Helper: render the array literal across lines.
+            auto renderArray = [&]() {
+                body += "[\n";
+                for (std::size_t k = 0; k < pairs.size(); ++k) {
+                    body += INDENT;
+                    body += INDENT;
+                    body += pairs[k].first;
+                    if (plc.isPair) {
+                        body += " => ";
+                        body += pairs[k].second;
+                    }
+                    body += ",\n";  // trailing comma on last item too
+                }
+                body += INDENT;
+                body += "]";
+            };
+            bool ok = true;
+            for (std::size_t k = 0; k < plc.paramNames.size(); ++k) {
+                if (needComma) body += ", ";
+                needComma = true;
+                bool isArr = (k == plc.pairsParamIdx);
+                // Switch to named once we hit any param past the first
+                // positional run, OR the [PreferNamed]-flagged param, OR
+                // when the param order would otherwise be ambiguous.
+                bool wantNamed = forceNamed
+                    || (k < plc.paramPreferNamed.size() && plc.paramPreferNamed[k])
+                    || (isArr && k != 0);
+                if (wantNamed) {
+                    body += plc.paramNames[k];
+                    body += ": ";
+                    forceNamed = true;
+                }
+                if (isArr) {
+                    renderArray();
+                } else {
+                    if (!bindings[k]) { ok = false; break; }
+                    body += *bindings[k];
+                }
+            }
+            if (!ok) continue;
+            body += ")";
+            std::size_t consumed = j - i;
+            if (!best || consumed > best->second) best = std::make_pair(std::move(body), consumed);
+        }
+        if (best) {
+            std::size_t consumedBytes = 0;
+            for (std::size_t k = 0; k < best->second; ++k) consumedBytes += stmts[i + k].consumed;
+            outStmts.push_back({stmts[i].offset, consumedBytes, std::move(best->first)});
+            i += best->second;
+        } else {
+            outStmts.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    stmts = std::move(outStmts);
+}
+// Recursive helper for tryMatchComposite -- walks a list of CompItems against
+// stmts starting at `idx`, returning the number of stmts consumed on success.
+// Handles flat calls, `return`, and block-form `if (cond) { body }` items.
+// Threads `bindings` through recursive calls so a param introduced in one
+// branch is checked-consistent against later uses (including inside if-blocks).
+std::optional<std::size_t> matchCompItems(
+        const std::vector<CompItem>& items,
+        const std::vector<DecodedInstr>& stmts,
+        std::size_t idx,
+        const std::size_t startIdx,
+        const std::unordered_set<int>& labelOffsets,
+        std::vector<std::optional<std::string>>& bindings,
+        const std::vector<std::string>& paramNames) {
+    const std::size_t origIdx = idx;
+    for (const auto& want : items) {
+        if (idx >= stmts.size()) return std::nullopt;
+        // No label may break a multi-stmt match between items (except at the
+        // very start of the outer match).
+        if (idx != startIdx && labelOffsets.count(static_cast<int>(stmts[idx].offset))) {
+            return std::nullopt;
+        }
+        if (want.isReturn) {
+            if (stmts[idx].body != "return") return std::nullopt;
+            ++idx;
+            continue;
+        }
+        if (want.isIfBlock) {
+            std::string_view b = stmts[idx].body;
+            if (!startsWith(b, "if (") || b.size() < 7 || b.back() != '{') return std::nullopt;
+            // Strip leading `if (` (4 chars) and trailing `) {` (3 chars).
+            std::string_view cond = b.substr(4, b.size() - 4 - 3);
+            if (!matchPredicateTemplate(want.condTokens, cond, bindings, paramNames)) {
+                return std::nullopt;
+            }
+            ++idx;
+            auto innerConsumed = matchCompItems(want.body, stmts, idx, startIdx,
+                                                labelOffsets, bindings, paramNames);
+            if (!innerConsumed) return std::nullopt;
+            idx += *innerConsumed;
+            if (idx >= stmts.size() || stmts[idx].body != "}") return std::nullopt;
+            ++idx;
+            continue;
+        }
+        // Flat call.
+        auto call = parseSimpleCall(stmts[idx].body);
+        if (!call) return std::nullopt;
+        if (call->mnemonic != want.mnemonic) return std::nullopt;
+        if (call->args.size() != want.args.size()) return std::nullopt;
+        for (std::size_t a = 0; a < want.args.size(); ++a) {
+            NamedArg gotNA = compSplitNamedArg(call->args[a]);
+            if (!want.args[a].fieldName.empty()
+                && want.args[a].fieldName != gotNA.fieldName) return std::nullopt;
+            const std::string& gotVal = gotNA.value;
+            if (want.args[a].paramIdx >= 0) {
+                int pi = want.args[a].paramIdx;
+                if (bindings[pi]) {
+                    if (*bindings[pi] != gotVal) return std::nullopt;
+                } else {
+                    bindings[pi] = gotVal;
+                }
+            } else {
+                const std::string& wantVal = want.args[a].value;
+                if (!matchArgValue(wantVal, gotVal, bindings, paramNames)) {
+                    return std::nullopt;
+                }
+            }
+        }
+        ++idx;
+    }
+    return idx - origIdx;
+}
+
+// Match one composite's body against the window starting at stmts[i].
+// On success, returns the (rewritten-call-body, stmts-consumed) pair.
+std::optional<std::pair<std::string, std::size_t>> tryMatchComposite(
+        const Composite& comp,
+        const std::vector<DecodedInstr>& stmts,
+        std::size_t i,
+        const std::unordered_set<int>& labelOffsets) {
+    std::vector<std::optional<std::string>> bindings(comp.paramNames.size());
+    auto consumed = matchCompItems(comp.items, stmts, i, i,
+                                    labelOffsets, bindings, comp.paramNames);
+    if (!consumed) return std::nullopt;
+    for (auto& b : bindings) {
+        if (!b) return std::nullopt;
+    }
+    // Default-trim: walk backwards and drop trailing params whose binding
+    // numerically equals their declared default.  Stops on first mismatch --
+    // a default-equal arg in the middle of differing trailing args has to
+    // stay (positional binding wouldn't survive its omission).  Named-style
+    // params are also kept; dropping them would silently change which slot
+    // the next positional arg lands in.
+    std::size_t emitCount = bindings.size();
+    while (emitCount > 0) {
+        std::size_t k = emitCount - 1;
+        if (k >= comp.paramDefaults.size() || !comp.paramDefaults[k]) break;
+        if (k < comp.paramPreferNamed.size() && comp.paramPreferNamed[k]) break;
+        if (!tokensNumericallyEqual(*bindings[k], *comp.paramDefaults[k])) break;
+        --emitCount;
+    }
+
+    std::string body = comp.name;
+    body += '(';
+    // The macro-call parser rejects positional args after named ones, so once
+    // any [PreferNamed] param is emitted with its `name:` prefix, every
+    // subsequent param must be named too (even if the signature didn't mark
+    // it [PreferNamed]).  This lets users sprinkle [PreferNamed] anywhere in
+    // the signature without re-ordering.
+    bool namedSeen = false;
+    for (std::size_t k = 0; k < emitCount; ++k) {
+        if (k) body += ", ";
+        bool wantNamed = namedSeen
+            || (k < comp.paramPreferNamed.size() && comp.paramPreferNamed[k]);
+        if (wantNamed) {
+            body += comp.paramNames[k];
+            body += ": ";
+            namedSeen = true;
+        }
+        // Render bare ints through the param's declared kind so the call
+        // reads `battle(Digimon.Agumon)` instead of `battle(3)`.  Non-int
+        // bindings (already-symbolic from a nested fold) pass through.
+        const std::string& bound = *bindings[k];
+        if (k < comp.paramKinds.size() && comp.paramKinds[k]) {
+            if (auto iv = tryParseInt(bound)) {
+                body += renderTypedValue(*iv, *comp.paramKinds[k]);
+                continue;
+            }
+        }
+        body += bound;
+    }
+    body += ')';
+    return std::make_pair(std::move(body), *consumed);
+}
+
+// One sweep of the generic beautifier; returns true if it rewrote anything.
+bool genericBeautifyOnce(std::vector<DecodedInstr>& stmts,
+                          const std::unordered_set<int>& labelOffsets) {
+    const auto& catalog = compositeCatalog();
+    if (catalog.empty()) return false;
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size());
+    bool changed = false;
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        // Longest-match-wins: prefer the composite that consumes the most stmts.
+        std::optional<std::pair<std::string, std::size_t>> bestMatch;
+        for (const auto& comp : catalog) {
+            auto m = tryMatchComposite(comp, stmts, i, labelOffsets);
+            if (!m) continue;
+            if (!bestMatch || m->second > bestMatch->second) bestMatch = std::move(m);
+        }
+        if (bestMatch) {
+            std::size_t consumed = 0;
+            for (std::size_t k = 0; k < bestMatch->second; ++k) {
+                consumed += stmts[i + k].consumed;
+            }
+            out.push_back({stmts[i].offset, consumed, std::move(bestMatch->first)});
+            i += bestMatch->second;
+            changed = true;
+        } else {
+            out.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    if (changed) stmts = std::move(out);
+    return changed;
+}
+
+void genericBeautifyComposites(std::vector<DecodedInstr>& stmts,
+                                const std::unordered_set<int>& labelOffsets) {
+    while (genericBeautifyOnce(stmts, labelOffsets)) {}
+}
+
 // Collapse consecutive `addStats/reduceStats/setStats(Stat.X, V)` runs into
 // the named-arg list form.  Threshold: 2 or more in a row with no label in
 // between.
@@ -535,6 +1785,30 @@ void beautifyStatsList(std::vector<DecodedInstr>& stmts,
 // Collapse consecutive same-mnemonic statements that differ in exactly one
 // numeric argument position by a stride of +1 into a `for id in S..E { ... }`
 // loop.  Requires >= 3 consecutive statements.  Loop variable is named `id`.
+// Split a `Kind(N)` token into (kind-prefix, int).  For plain ints the
+// prefix is empty.  Returns nullopt when the arg can't be reduced to an
+// integer at all (e.g. a string literal or a `Kind.Name` we couldn't
+// resolve symbolically).
+struct TypedInt { std::string prefix; int value; };
+std::optional<TypedInt> typedIntFromArg(std::string_view arg) {
+    if (auto v = tryParseInt(arg)) return TypedInt{"", *v};
+    if (arg.size() > 3 && arg.back() == ')'
+        && arg[0] >= 'A' && arg[0] <= 'Z') {
+        auto lp = arg.find('(');
+        if (lp != std::string_view::npos
+            && symKindFromLabel(arg.substr(0, lp))) {
+            auto inner = arg.substr(lp + 1, arg.size() - lp - 2);
+            if (auto v = tryParseInt(inner)) {
+                return TypedInt{std::string{arg.substr(0, lp + 1)}, *v};
+            }
+        }
+    }
+    if (auto v = tryResolveSymbolicToken(arg)) {
+        return TypedInt{"", *v};
+    }
+    return std::nullopt;
+}
+
 void beautifyForRanges(std::vector<DecodedInstr>& stmts,
                        const std::unordered_set<int>& labelOffsets) {
     std::vector<DecodedInstr> out;
@@ -565,9 +1839,9 @@ void beautifyForRanges(std::vector<DecodedInstr>& stmts,
                 }
             }
             if (!ok || d == -1) break;
-            auto va = tryParseInt(cPrev->args[d]);
-            auto vb = tryParseInt(cj->args[d]);
-            if (!va || !vb || *vb - *va != 1) break;
+            auto va = typedIntFromArg(cPrev->args[d]);
+            auto vb = typedIntFromArg(cj->args[d]);
+            if (!va || !vb || va->prefix != vb->prefix || vb->value - va->value != 1) break;
             if (diffPos == -1) diffPos = d;
             else if (diffPos != d) break;
             runEnd = j;
@@ -575,8 +1849,8 @@ void beautifyForRanges(std::vector<DecodedInstr>& stmts,
         std::size_t runLen = runEnd - i + 1;
         if (runLen >= 3 && diffPos != -1) {
             auto cEnd = parseSimpleCall(stmts[runEnd].body);
-            auto vS = tryParseInt(c0->args[diffPos]);
-            auto vE = tryParseInt(cEnd->args[diffPos]);
+            auto vS = typedIntFromArg(c0->args[diffPos]);
+            auto vE = typedIntFromArg(cEnd->args[diffPos]);
             // Build the loop-body call with `id` replacing the iterator slot.
             std::string call{c0->mnemonic};
             call += '(';
@@ -586,10 +1860,18 @@ void beautifyForRanges(std::vector<DecodedInstr>& stmts,
                 else call.append(c0->args[k]);
             }
             call += ')';
+            // Render endpoints in whatever shape the source used -- bare int
+            // or `Kind(N)` wrapper -- so the range form mirrors the call.
+            auto renderEndpoint = [&](const TypedInt& t) {
+                std::string s = t.prefix;
+                s += toDec(static_cast<long long>(t.value));
+                if (!t.prefix.empty()) s += ')';
+                return s;
+            };
             std::string forBody = "for id in ";
-            forBody += toDec(static_cast<long long>(*vS));
+            forBody += renderEndpoint(*vS);
             forBody += "..";
-            forBody += toDec(static_cast<long long>(*vE));
+            forBody += renderEndpoint(*vE);
             forBody += " {\n";
             forBody += INDENT;
             forBody += INDENT;
@@ -664,184 +1946,6 @@ void beautifyChoice(std::vector<DecodedInstr>& stmts,
                         continue;
                     }
                 }
-            }
-        }
-        out.push_back(stmts[i]);
-        ++i;
-    }
-    stmts = std::move(out);
-}
-
-// Collapse `fadeOutHUD(); delay(1); startBattle(...);` triples into a single
-// `startBattle(...);` -- the prelude is universal in the shipping corpus and
-// the parser re-adds it via sugar.
-void beautifyStartBattle(std::vector<DecodedInstr>& stmts,
-                         const std::unordered_set<int>& labelOffsets) {
-    std::vector<DecodedInstr> out;
-    out.reserve(stmts.size());
-    std::size_t i = 0;
-    while (i < stmts.size()) {
-        if (i + 2 < stmts.size()
-            && !labelOffsets.count(static_cast<int>(stmts[i + 1].offset))
-            && !labelOffsets.count(static_cast<int>(stmts[i + 2].offset))) {
-            auto c0 = parseSimpleCall(stmts[i].body);
-            auto c1 = parseSimpleCall(stmts[i + 1].body);
-            auto c2 = parseSimpleCall(stmts[i + 2].body);
-            if (c0 && c0->mnemonic == "fadeOutHUD" && c0->args.empty()
-                && c1 && c1->mnemonic == "delay" && c1->args.size() == 1 && c1->args[0] == "1"
-                && c2 && c2->mnemonic == "startBattle") {
-                std::size_t consumed = stmts[i].consumed
-                                     + stmts[i + 1].consumed
-                                     + stmts[i + 2].consumed;
-                out.push_back({stmts[i].offset, consumed, stmts[i + 2].body});
-                i += 3;
-                continue;
-            }
-        }
-        out.push_back(stmts[i]);
-        ++i;
-    }
-    stmts = std::move(out);
-}
-
-// Collapse `loadDigimon(D); setDigimon(D, E, A);` (same digimon ID in both
-// slots) into a single `loadAndSetDigimon(D, E, A);` call.  Matching
-// macro lives in functions.dgs and expands back to the two opcodes.
-void beautifyLoadAndSetDigimon(std::vector<DecodedInstr>& stmts,
-                               const std::unordered_set<int>& labelOffsets) {
-    std::vector<DecodedInstr> out;
-    out.reserve(stmts.size());
-    std::size_t i = 0;
-    while (i < stmts.size()) {
-        if (i + 1 < stmts.size()
-            && !labelOffsets.count(static_cast<int>(stmts[i + 1].offset))) {
-            auto c0 = parseSimpleCall(stmts[i].body);
-            auto c1 = parseSimpleCall(stmts[i + 1].body);
-            if (c0 && c1
-                && c0->mnemonic == "loadDigimon" && c0->args.size() == 1
-                && c1->mnemonic == "setDigimon"  && c1->args.size() == 3
-                && c0->args[0] == c1->args[0]) {
-                std::string body = "loadAndSetDigimon(";
-                body.append(c0->args[0]);
-                body += ", ";
-                body.append(c1->args[1]);
-                body += ", ";
-                body.append(c1->args[2]);
-                body += ')';
-                std::size_t consumed = stmts[i].consumed + stmts[i + 1].consumed;
-                out.push_back({stmts[i].offset, consumed, std::move(body)});
-                i += 2;
-                continue;
-            }
-        }
-        out.push_back(stmts[i]);
-        ++i;
-    }
-    stmts = std::move(out);
-}
-
-// Collapse the "section preamble" -- `setScript(S, M); setPStat(245, V);
-// setBGM(B);` -- into a single `switchToMap(S, M, V, B)` call.  The 245
-// slot is the canonical current-map pstat.  Matching macro in functions.dgs
-// expands back to the three underlying opcodes.
-void beautifySwitchToMap(std::vector<DecodedInstr>& stmts,
-                         const std::unordered_set<int>& labelOffsets) {
-    std::vector<DecodedInstr> out;
-    out.reserve(stmts.size());
-    std::size_t i = 0;
-    while (i < stmts.size()) {
-        if (i + 2 < stmts.size()
-            && !labelOffsets.count(static_cast<int>(stmts[i + 1].offset))
-            && !labelOffsets.count(static_cast<int>(stmts[i + 2].offset))) {
-            auto c0 = parseSimpleCall(stmts[i].body);
-            auto c1 = parseSimpleCall(stmts[i + 1].body);
-            auto c2 = parseSimpleCall(stmts[i + 2].body);
-            if (c0 && c1 && c2
-                && c0->mnemonic == "setScript" && c0->args.size() == 2
-                && c1->mnemonic == "setPStat"  && c1->args.size() == 2
-                && c1->args[0] == "245"
-                && c2->mnemonic == "setBGM"    && c2->args.size() == 1) {
-                std::string body = "switchToMap(";
-                body.append(c0->args[0]); body += ", ";
-                body.append(c0->args[1]); body += ", ";
-                body.append(c1->args[1]); body += ", ";
-                body.append(c2->args[0]);
-                body += ')';
-                std::size_t consumed = stmts[i].consumed
-                                     + stmts[i + 1].consumed
-                                     + stmts[i + 2].consumed;
-                out.push_back({stmts[i].offset, consumed, std::move(body)});
-                i += 3;
-                continue;
-            }
-        }
-        out.push_back(stmts[i]);
-        ++i;
-    }
-    stmts = std::move(out);
-}
-
-// Collapse `sectionOnExit(T); callDigimonSubroutine(R); waitForEntity(Entity.System);`
-// into a single `runDigimonRoutine(T, R)` call.  The third stmt's arg is
-// always the System entity in the shipping corpus; if it ever isn't, the
-// pattern stays uncollapsed.
-void beautifyRunDigimonRoutine(std::vector<DecodedInstr>& stmts,
-                               const std::unordered_set<int>& labelOffsets) {
-    std::vector<DecodedInstr> out;
-    out.reserve(stmts.size());
-    std::size_t i = 0;
-    while (i < stmts.size()) {
-        if (i + 2 < stmts.size()
-            && !labelOffsets.count(static_cast<int>(stmts[i + 1].offset))
-            && !labelOffsets.count(static_cast<int>(stmts[i + 2].offset))) {
-            auto c0 = parseSimpleCall(stmts[i].body);
-            auto c1 = parseSimpleCall(stmts[i + 1].body);
-            auto c2 = parseSimpleCall(stmts[i + 2].body);
-            if (c0 && c1 && c2
-                && c0->mnemonic == "sectionOnExit"          && c0->args.size() == 1
-                && c1->mnemonic == "callDigimonSubroutine"  && c1->args.size() == 1
-                && c2->mnemonic == "waitForEntity"          && c2->args.size() == 1
-                && (c2->args[0] == "Entity.System" || c2->args[0] == "255")) {
-                std::string body = "runDigimonRoutine(";
-                body.append(c0->args[0]); body += ", ";
-                body.append(c1->args[0]);
-                body += ')';
-                std::size_t consumed = stmts[i].consumed
-                                     + stmts[i + 1].consumed
-                                     + stmts[i + 2].consumed;
-                out.push_back({stmts[i].offset, consumed, std::move(body)});
-                i += 3;
-                continue;
-            }
-        }
-        out.push_back(stmts[i]);
-        ++i;
-    }
-    stmts = std::move(out);
-}
-
-void beautifySpeak(std::vector<DecodedInstr>& stmts,
-                   const std::unordered_set<int>& labelOffsets) {
-    std::vector<DecodedInstr> out;
-    out.reserve(stmts.size());
-    std::size_t i = 0;
-    while (i < stmts.size()) {
-        if (i + 1 < stmts.size()
-            && !labelOffsets.count(static_cast<int>(stmts[i + 1].offset))) {
-            auto c0 = parseSimpleCall(stmts[i].body);
-            auto c1 = parseSimpleCall(stmts[i + 1].body);
-            if (c0 && c1
-                && c0->mnemonic == "setDialogOwner" && c0->args.size() == 1
-                && c1->mnemonic == "showTextbox"    && c1->args.size() == 1) {
-                std::string body = "speak(";
-                body.append(c0->args[0]);
-                body += ", ";
-                body.append(c1->args[0]);
-                body += ')';
-                std::size_t consumed = stmts[i].consumed + stmts[i + 1].consumed;
-                out.push_back({stmts[i].offset, consumed, std::move(body)});
-                i += 2;
-                continue;
             }
         }
         out.push_back(stmts[i]);
@@ -1068,6 +2172,52 @@ void beautifyForArray(std::vector<DecodedInstr>& stmts,
         i = runEnd + 1;
     }
     stmts = std::move(out);
+}
+
+// Extract the value side of a `label: value` named-arg slot.  Returns the
+
+// Collapse a beautifyForRanges output of shape
+//     for id in S..E {
+//       setObjectVisibility(id, V);
+//     }
+// (already a single DecodedInstr whose body is the multi-line string emitted
+// by beautifyForRanges) into a flat `setObjectsVisibleRange(S, E, V);` call.
+// Runs after beautifyForRanges.
+void beautifySetObjectsVisibleRange(std::vector<DecodedInstr>& stmts,
+                                    const std::unordered_set<int>& /*labelOffsets*/) {
+    for (auto& stmt : stmts) {
+        std::string_view body = stmt.body;
+        constexpr std::string_view kPrefix = "for id in ";
+        if (body.substr(0, kPrefix.size()) != kPrefix) continue;
+        std::size_t dots = body.find("..", kPrefix.size());
+        if (dots == std::string_view::npos) continue;
+        std::size_t braceOpen = body.find(" {\n", dots);
+        if (braceOpen == std::string_view::npos) continue;
+        std::string_view s = body.substr(kPrefix.size(), dots - kPrefix.size());
+        std::string_view e = body.substr(dots + 2, braceOpen - dots - 2);
+        std::size_t inner = braceOpen + 3;  // past " {\n"
+        // Skip the body-line indent.
+        while (inner < body.size() && (body[inner] == ' ' || body[inner] == '\t')) ++inner;
+        std::size_t lineEnd = body.find(";\n", inner);
+        if (lineEnd == std::string_view::npos) continue;
+        std::string_view callExpr = body.substr(inner, lineEnd - inner);
+        // Trailing line must be the closer (allow any indent + "}").
+        std::size_t after = lineEnd + 2;
+        while (after < body.size() && (body[after] == ' ' || body[after] == '\t')) ++after;
+        if (after >= body.size() || body[after] != '}') continue;
+        // The inner call must be exactly `setObjectVisibility(id, V)`.
+        auto inner_call = parseSimpleCall(callExpr);
+        if (!inner_call) continue;
+        if (inner_call->mnemonic != "setObjectVisibility") continue;
+        if (inner_call->args.size() != 2) continue;
+        if (inner_call->args[0] != "id") continue;
+        std::string rewritten = "setObjectsVisibleRange(";
+        rewritten.append(s); rewritten += ", ";
+        rewritten.append(e); rewritten += ", ";
+        rewritten.append(inner_call->args[1]);
+        rewritten += ')';
+        stmt.body = std::move(rewritten);
+    }
 }
 
 // Collapse consecutive `learnMove(Move.X);` runs into `learnMoves([...]);`.
@@ -1310,6 +2460,1211 @@ bool beautifyLoopsOnce(std::vector<DecodedInstr>& stmts,
     }
     stmts = std::move(out);
     return changed;
+}
+
+// Collapse the canonical two-way-jump if/else shape:
+//   stmts[i]:     if (<cond>) goto Lthen; else goto Lelse
+//   stmts[i+1]:   Lthen attached, body_then[0]
+//   ...
+//   stmts[i+m]:   goto L_<hex_end>    (the join goto; closes the then-body)
+//   stmts[i+m+1]: Lelse attached, body_else[0]
+//   ...
+//   stmts[j_end]: Lend attached      (first stmt after the if/else)
+// into `if (<cond>) { body_then } else { body_else }`.  No predicate negation
+// needed -- both branches jump unconditionally.
+//
+// Conservative -- bail unless every guarantee holds:
+//   - Three labels Lthen, Lelse, Lend in this section with no cross-section refs.
+//   - Each label referenced exactly once: Lthen via stmts[i], Lelse via stmts[i],
+//     Lend via stmts[i+m] (the join goto).
+//   - Lthen.offset == stmts[i+1].offset (fall-through label).
+//   - Join goto exists immediately before Lelse and is exactly `goto L_<4hex>`.
+//
+// On success: replace stmts[i] with `if (cond) {` (consumed unchanged),
+// keep body_then[0..m-1] unchanged, splice `} else {` at the join-goto's
+// offset (consumed = join-goto's bytes so totals match), keep body_else
+// unchanged, and splice `}` at Lend.offset (consumed = 0).  Erase all
+// three labels from secLabels.
+bool beautifyIfElseOnce(std::vector<DecodedInstr>& stmts,
+                        std::unordered_set<int>& secLabels,
+                        const std::unordered_set<int>& crossSecRefs) {
+    std::unordered_map<int, int> refCount;
+    for (const auto& s : stmts) {
+        std::vector<int> refs;
+        collectSameSecLabelRefs(s.body, refs);
+        for (int off : refs) ++refCount[off];
+    }
+
+    auto parseHex4 = [](std::string_view s, std::size_t at, int& out) {
+        out = 0;
+        for (int k = 0; k < 4; ++k) {
+            char c = s[at + k];
+            if (c >= '0' && c <= '9') out = out * 16 + (c - '0');
+            else if (c >= 'a' && c <= 'f') out = out * 16 + (c - 'a' + 10);
+            else return false;
+        }
+        return true;
+    };
+
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size() + 6);
+    bool changed = false;
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        bool matched = false;
+        do {
+            std::string_view body = stmts[i].body;
+            if (!startsWith(body, "if (")) break;
+            std::size_t elseMark = body.find("; else goto L_");
+            if (elseMark == std::string_view::npos) break;
+            if (elseMark + 14 + 4 != body.size()) break;
+            int else_off = 0;
+            if (!parseHex4(body, elseMark + 14, else_off)) break;
+            std::string_view prefix = body.substr(0, elseMark);
+            std::size_t thenGoto = prefix.rfind(") goto L_");
+            if (thenGoto == std::string_view::npos) break;
+            if (thenGoto + 9 + 4 != prefix.size()) break;
+            int then_off = 0;
+            if (!parseHex4(prefix, thenGoto + 9, then_off)) break;
+
+            std::string_view cond = body.substr(4, thenGoto - 4);
+
+            if (i + 1 >= stmts.size()) break;
+            if (static_cast<int>(stmts[i + 1].offset) != then_off) break;
+
+            std::size_t j_else = SIZE_MAX;
+            for (std::size_t k = i + 2; k < stmts.size(); ++k) {
+                if (static_cast<int>(stmts[k].offset) == else_off) { j_else = k; break; }
+            }
+            if (j_else == SIZE_MAX || j_else <= i + 1) break;
+
+            std::string_view joinBody = stmts[j_else - 1].body;
+            if (joinBody.size() != 11) break;
+            if (!startsWith(joinBody, "goto L_")) break;
+            int end_off = 0;
+            if (!parseHex4(joinBody, 7, end_off)) break;
+
+            std::size_t j_end = SIZE_MAX;
+            for (std::size_t k = j_else + 1; k < stmts.size(); ++k) {
+                if (static_cast<int>(stmts[k].offset) == end_off) { j_end = k; break; }
+            }
+            if (j_end == SIZE_MAX) break;
+
+            if (!secLabels.count(then_off) || !secLabels.count(else_off) || !secLabels.count(end_off)) break;
+            if (crossSecRefs.count(then_off) || crossSecRefs.count(else_off) || crossSecRefs.count(end_off)) break;
+            auto rc = [&](int off) {
+                auto it = refCount.find(off);
+                return it == refCount.end() ? 0 : it->second;
+            };
+            if (rc(then_off) != 1 || rc(else_off) != 1 || rc(end_off) != 1) break;
+
+            std::string openLine = "if (";
+            openLine.append(cond);
+            openLine += ") {";
+            out.push_back({stmts[i].offset, stmts[i].consumed, std::move(openLine)});
+            for (std::size_t k = i + 1; k < j_else - 1; ++k) out.push_back(stmts[k]);
+            out.push_back({stmts[j_else - 1].offset, stmts[j_else - 1].consumed, "} else {"});
+            for (std::size_t k = j_else; k < j_end; ++k) out.push_back(stmts[k]);
+            out.push_back({static_cast<std::size_t>(end_off), 0, "}"});
+
+            secLabels.erase(then_off);
+            secLabels.erase(else_off);
+            secLabels.erase(end_off);
+
+            changed = true;
+            i = j_end;
+            matched = true;
+        } while (false);
+
+        if (!matched) {
+            out.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    stmts = std::move(out);
+    return changed;
+}
+
+// Cosmetic pass: collapse the nested form `} else { if (X) { ... } }` (with
+// the inner-if's matching close immediately followed by the outer close) into
+// `} else if (X) { ... }`.  No bytes change -- the inner-if's open had its
+// own consumed-bytes count, which gets absorbed into the merged marker.
+//
+// `elsif` is accepted as input by the parser but NEVER emitted here; the
+// canonical disasm output is always `else if`.
+//
+// Bail unless:
+//   - stmts[k].body == "} else {"
+//   - stmts[k+1].body starts with "if (" and ends with "{"
+//   - The inner-if's matching close is a plain `}` at some index K (treating
+//     `} else {` as net-zero so an inner with-else still has a single matching
+//     close at its eventual `}`).
+//   - stmts[K+1].body == "}" -- the outer if/else's close immediately follows.
+bool beautifyElseIfChainOnce(std::vector<DecodedInstr>& stmts) {
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size());
+    bool changed = false;
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        bool matched = false;
+        do {
+            if (stmts[i].body != "} else {") break;
+            if (i + 1 >= stmts.size()) break;
+            std::string_view innerOpen = stmts[i + 1].body;
+            if (!startsWith(innerOpen, "if (")) break;
+            if (innerOpen.back() != '{') break;
+
+            // Find K: matching `}` close of the inner-if at depth 0 (relative
+            // to inner).  `} else {` inside is net-zero, never a match.
+            std::size_t K = SIZE_MAX;
+            int depth = 1;
+            for (std::size_t j = i + 2; j < stmts.size(); ++j) {
+                std::string_view b = stmts[j].body;
+                if (b == "}") {
+                    --depth;
+                    if (depth == 0) { K = j; break; }
+                } else if (b == "} else {") {
+                    // Net zero: close + reopen at same level.  Doesn't match.
+                    continue;
+                } else if (!b.empty() && b.back() == '{') {
+                    ++depth;
+                }
+            }
+            if (K == SIZE_MAX) break;
+            if (K + 1 >= stmts.size()) break;
+            if (stmts[K + 1].body != "}") break;
+
+            // Build the merged marker: "} else if (X) {".  Absorb the inner
+            // open's consumed bytes (the inner if-opcode) into stmts[i]'s
+            // consumed so totals balance after dropping it.
+            std::string merged = "} else if (";
+            merged.append(innerOpen.substr(4, innerOpen.size() - 4 - 2));  // strip "if (" / ") {"
+            merged += ") {";
+
+            out.push_back({stmts[i].offset,
+                           stmts[i].consumed + stmts[i + 1].consumed,
+                           std::move(merged)});
+            // body between inner-open (i+1) and inner-close (K) unchanged.
+            for (std::size_t k = i + 2; k < K; ++k) {
+                out.push_back(stmts[k]);
+            }
+            // Drop stmts[K] (inner close) -- consumed=0, no byte loss.
+            // Keep stmts[K+1] (the outer close `}`) as the merged close.
+            out.push_back(stmts[K + 1]);
+
+            changed = true;
+            i = K + 2;
+            matched = true;
+        } while (false);
+
+        if (!matched) {
+            out.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    stmts = std::move(out);
+    return changed;
+}
+
+// Post-v1 pass: take a single-arm `if (X) { body; goto Lend; }` followed by
+// `body_else; Lend:` and rewrite as `if (X) { body } else { body_else }`.
+//
+// The original engine compiles source-level if/else into the single-branch
+// shape (`if (negated) goto Lelse; body_then; goto Lend; Lelse: body_else; Lend:`),
+// not the two-way-jump opcode shape — so the v1 pass already half-collapsed
+// it into a single-arm block; this pass recovers the rest.
+//
+// Conservative -- bail unless:
+//   - stmts[i] is `if (X) {` (post-v1 open), matched close `}` (not `} else {`).
+//   - Last body stmt (just before the close) is exactly `goto L_<4hex>`.
+//   - body_else spans up to that label, with balanced braces (no escape past
+//     the enclosing scope).
+//   - Lend in-section, no cross-section refs, exactly one same-section ref
+//     (the trailing goto we're dropping).
+bool beautifyIfElseFromSingleArmOnce(std::vector<DecodedInstr>& stmts,
+                                     std::unordered_set<int>& secLabels,
+                                     const std::unordered_set<int>& crossSecRefs) {
+    std::unordered_map<int, int> refCount;
+    for (const auto& s : stmts) {
+        std::vector<int> refs;
+        collectSameSecLabelRefs(s.body, refs);
+        for (int off : refs) ++refCount[off];
+    }
+
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size() + 4);
+    bool changed = false;
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        bool matched = false;
+        do {
+            std::string_view body = stmts[i].body;
+            if (body.size() < 5) break;
+            if (!startsWith(body, "if (")) break;
+            if (body.back() != '{') break;
+
+            // Find matching close `}` (NOT `} else {` — that's already if/else).
+            std::size_t j_close = SIZE_MAX;
+            int depth = 1;
+            bool alreadyElse = false;
+            for (std::size_t k = i + 1; k < stmts.size(); ++k) {
+                std::string_view b = stmts[k].body;
+                if (b == "} else {") {
+                    --depth;
+                    if (depth == 0) { alreadyElse = true; break; }
+                    ++depth;
+                    continue;
+                }
+                if (b == "}") {
+                    --depth;
+                    if (depth == 0) { j_close = k; break; }
+                    continue;
+                }
+                if (!b.empty() && b.back() == '{') ++depth;
+            }
+            if (alreadyElse || j_close == SIZE_MAX) break;
+            if (j_close <= i + 1) break;
+
+            std::string_view tailBody = stmts[j_close - 1].body;
+            if (tailBody.size() != 11) break;
+            if (!startsWith(tailBody, "goto L_")) break;
+            int end_off = 0;
+            bool ok = true;
+            for (int k = 0; k < 4; ++k) {
+                char c = tailBody[7 + k];
+                if (c >= '0' && c <= '9') end_off = end_off * 16 + (c - '0');
+                else if (c >= 'a' && c <= 'f') end_off = end_off * 16 + (c - 'a' + 10);
+                else { ok = false; break; }
+            }
+            if (!ok) break;
+
+            std::size_t j_end = SIZE_MAX;
+            for (std::size_t k = j_close + 1; k < stmts.size(); ++k) {
+                if (static_cast<int>(stmts[k].offset) == end_off) { j_end = k; break; }
+            }
+            if (j_end == SIZE_MAX) break;
+
+            // body_else span (j_close+1 .. j_end-1) must have balanced braces
+            // so it doesn't escape the enclosing scope.
+            int d = 0;
+            bool escapes = false;
+            for (std::size_t k = j_close + 1; k < j_end; ++k) {
+                std::string_view b = stmts[k].body;
+                if (b == "}") {
+                    --d;
+                    if (d < 0) { escapes = true; break; }
+                } else if (b == "} else {") {
+                    --d;
+                    if (d < 0) { escapes = true; break; }
+                    ++d;
+                } else if (!b.empty() && b.back() == '{') {
+                    ++d;
+                }
+            }
+            if (escapes || d != 0) break;
+
+            if (!secLabels.count(end_off)) break;
+            if (crossSecRefs.count(end_off)) break;
+            auto it = refCount.find(end_off);
+            if (it == refCount.end() || it->second != 1) break;
+
+            // Collapse.  Open unchanged, body_then minus trailing goto, then
+            // `} else {` absorbs the goto's bytes, body_else unchanged, new
+            // close `}` at end_off (consumed=0).
+            out.push_back(stmts[i]);
+            for (std::size_t k = i + 1; k < j_close - 1; ++k) out.push_back(stmts[k]);
+            out.push_back({stmts[j_close - 1].offset, stmts[j_close - 1].consumed, "} else {"});
+            for (std::size_t k = j_close + 1; k < j_end; ++k) out.push_back(stmts[k]);
+            out.push_back({static_cast<std::size_t>(end_off), 0, "}"});
+
+            secLabels.erase(end_off);
+            changed = true;
+            i = j_end;
+            matched = true;
+        } while (false);
+
+        if (!matched) {
+            out.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    stmts = std::move(out);
+    return changed;
+}
+
+// Collapse `if (<cond>) goto Lx; <body>; Lx:` (the canonical engine shape:
+// skip-when-cond) back to the source-level block form `if (<negated>) { <body> }`.
+//
+// Conservative -- bail unless EVERY guarantee holds, since the negator has
+// to produce a string the assembler re-encodes to identical bytes:
+//   - Body matches exactly `if (<cond>) goto L_<4hex>` (no else, no tail).
+//   - L_<4hex> is in this section's labels and has NO cross-section refs.
+//   - In-section refs to L_<4hex> total exactly one (this goto).  No other
+//     code reaches the close label; dropping it can't strand any branch.
+//   - A stmt exists at offset L_<4hex> (the close anchor).
+//   - The negator accepts every atom in <cond> (rejects `hasTech` / `(cond&...)`).
+//
+// Multi-predecessor merge labels (refCount > 1) are intentionally LEFT
+// alone here -- relaxing the single-arm wrap to fire greedily on multi-pred
+// labels was tried and regressed total label count: `beautifyBlocksOnce`
+// later in the pipeline produces strictly tighter `{ break; ... }` wraps
+// for those cases, and a greedy single-arm pre-wrap preempts that.
+//
+// On success: replace stmts[i] with `if (<negate(cond)>) {` keeping the
+// original `consumed` (these bytes are still the same `if` opcode), keep
+// the body stmts unchanged, splice a synthetic `}` (consumed=0) at the
+// close anchor, and erase the close label from secLabels.
+bool beautifyIfBlocksOnce(std::vector<DecodedInstr>& stmts,
+                          std::unordered_set<int>& secLabels,
+                          const std::unordered_set<int>& crossSecRefs) {
+    std::unordered_map<int, int> sameSecRefCount;
+    for (const auto& s : stmts) {
+        std::vector<int> refs;
+        collectSameSecLabelRefs(s.body, refs);
+        for (int off : refs) ++sameSecRefCount[off];
+    }
+
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size() + 4);
+    bool changed = false;
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        std::string_view body = stmts[i].body;
+        bool matched = false;
+        do {
+            if (body.size() < 4) break;
+            if (body[0] != 'i' || body[1] != 'f' || body[2] != ' ' || body[3] != '(') break;
+            // Reject if-then-else form: it has `; else goto` in the body.
+            if (body.find("; else goto") != std::string_view::npos) break;
+
+            std::size_t suffix = body.rfind(") goto L_");
+            if (suffix == std::string_view::npos) break;
+            // Body must END with `) goto L_<4hex>` -- exactly 9+4 chars after suffix.
+            if (suffix + 9 + 4 != body.size()) break;
+
+            int targetOff = 0;
+            bool okHex = true;
+            for (int k = 0; k < 4; ++k) {
+                char c = body[suffix + 9 + k];
+                if (c >= '0' && c <= '9') targetOff = targetOff * 16 + (c - '0');
+                else if (c >= 'a' && c <= 'f') targetOff = targetOff * 16 + (c - 'a' + 10);
+                else { okHex = false; break; }
+            }
+            if (!okHex) break;
+
+            if (!secLabels.count(targetOff)) break;
+            if (crossSecRefs.count(targetOff)) break;
+            auto rcIt = sameSecRefCount.find(targetOff);
+            if (rcIt == sameSecRefCount.end() || rcIt->second != 1) break;
+
+            std::size_t j = SIZE_MAX;
+            for (std::size_t k = i + 1; k < stmts.size(); ++k) {
+                if (static_cast<int>(stmts[k].offset) == targetOff) { j = k; break; }
+            }
+            if (j == SIZE_MAX) break;
+
+            std::string_view cond = body.substr(4, suffix - 4);
+            std::string negCond;
+            try {
+                negCond = predneg::negatePredicate(cond);
+            } catch (...) {
+                break;
+            }
+
+            std::string open = "if (";
+            open += negCond;
+            open += ") {";
+            out.push_back({stmts[i].offset, stmts[i].consumed, std::move(open)});
+            for (std::size_t k = i + 1; k < j; ++k) {
+                out.push_back(stmts[k]);
+            }
+            out.push_back({static_cast<std::size_t>(targetOff), 0, "}"});
+            secLabels.erase(targetOff);
+            changed = true;
+            i = j;
+            matched = true;
+        } while (false);
+
+        if (!matched) {
+            out.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    stmts = std::move(out);
+    return changed;
+}
+
+// Fold runs of `if (pstat[X] == K_i) { body }` bodied-ifs (same X, distinct
+// K_i, >=2 arms) into a single `switch pstat[X] { K => { body } ... }`.
+// Optionally absorbs a trailing inverse-encoded arm
+// `if (pstat[X] != K_else) goto L; body; L:` as `else K_else => { body }`
+// when the body span between the if and L contains no labels.
+//
+// Byte-faithful: the assembler re-emits `K => { body }` as the same single
+// 0x19 (`if (pstat[X] != K) goto __end; body; __end:`) it would emit for a
+// hand-written eq-chain.  The `else K =>` form lowers identically -- its
+// bypass label naturally coincides with whatever label sits at the
+// post-switch byte position in the original.
+bool beautifySwitchOnce(std::vector<DecodedInstr>& stmts,
+                        const std::unordered_set<int>& secLabels) {
+    auto braceDelta = [](std::string_view b) {
+        int d = 0;
+        if (!b.empty() && b.front() == '}') --d;
+        if (!b.empty() && b.back()  == '{') ++d;
+        return d;
+    };
+
+    // Find the closer (depth=0) for an opener at `i`.  Assumes stmts[i]'s
+    // body ends in `{` (i.e. it really is an opener).  Returns SIZE_MAX if no
+    // matching closer exists in the current scope.
+    auto matchCloser = [&](std::size_t i) -> std::size_t {
+        int depth = 1;
+        for (std::size_t k = i + 1; k < stmts.size(); ++k) {
+            int d = braceDelta(stmts[k].body);
+            // Apply close part first (so `} else {` at depth=1 stays in scope).
+            std::string_view b = stmts[k].body;
+            if (!b.empty() && b.front() == '}') {
+                --depth;
+                if (depth == 0) return k;
+            }
+            if (!b.empty() && b.back() == '{') ++depth;
+            (void)d;
+        }
+        return SIZE_MAX;
+    };
+
+    // Parse an `if (pstat[X] == K) {` opener.  Returns {xExpr, K} on match.
+    auto tryParseEqOpener = [](std::string_view body) -> std::optional<std::pair<std::string, long long>> {
+        if (!startsWith(body, "if (pstat[")) return std::nullopt;
+        if (body.empty() || body.back() != '{') return std::nullopt;
+        std::size_t rb = body.find(']', 10);
+        if (rb == std::string_view::npos) return std::nullopt;
+        std::string_view xExpr = body.substr(10, rb - 10);
+        if (rb + 5 > body.size()) return std::nullopt;
+        if (body.compare(rb + 1, 4, " == ") != 0) return std::nullopt;
+        std::size_t kStart = rb + 5;
+        std::size_t kEnd = body.find(')', kStart);
+        if (kEnd == std::string_view::npos) return std::nullopt;
+        // After `)` must be ` {` (the opener suffix).
+        if (kEnd + 2 >= body.size()) return std::nullopt;
+        if (body[kEnd + 1] != ' ' || body[kEnd + 2] != '{') return std::nullopt;
+        // No further chars after ` {`.
+        if (kEnd + 3 != body.size()) return std::nullopt;
+        // Parse K as a signed decimal.
+        std::string_view kStr = body.substr(kStart, kEnd - kStart);
+        if (kStr.empty()) return std::nullopt;
+        long long sign = 1;
+        std::size_t p = 0;
+        if (kStr[0] == '-') { sign = -1; p = 1; }
+        if (p == kStr.size()) return std::nullopt;
+        long long K = 0;
+        for (; p < kStr.size(); ++p) {
+            char c = kStr[p];
+            if (c < '0' || c > '9') return std::nullopt;
+            K = K * 10 + (c - '0');
+        }
+        return std::make_pair(std::string{xExpr}, sign * K);
+    };
+
+    // Parse a non-bodied trailing `if (pstat[X] != K) goto L_xxxx`.
+    // Returns {xExpr, K, targetOff}.
+    auto tryParseNeqGoto = [](std::string_view body) -> std::optional<std::tuple<std::string, long long, int>> {
+        if (!startsWith(body, "if (pstat[")) return std::nullopt;
+        std::size_t suffix = body.rfind(") goto L_");
+        if (suffix == std::string_view::npos) return std::nullopt;
+        if (suffix + 9 + 4 != body.size()) return std::nullopt;
+        int targetOff = 0;
+        for (int q = 0; q < 4; ++q) {
+            char c = body[suffix + 9 + q];
+            if      (c >= '0' && c <= '9') targetOff = targetOff * 16 + (c - '0');
+            else if (c >= 'a' && c <= 'f') targetOff = targetOff * 16 + (c - 'a' + 10);
+            else return std::nullopt;
+        }
+        std::size_t rb = body.find(']', 10);
+        if (rb == std::string_view::npos || rb >= suffix) return std::nullopt;
+        std::string_view xExpr = body.substr(10, rb - 10);
+        if (rb + 5 > body.size()) return std::nullopt;
+        if (body.compare(rb + 1, 4, " != ") != 0) return std::nullopt;
+        std::size_t kStart = rb + 5;
+        if (kStart >= suffix) return std::nullopt;
+        std::string_view kStr = body.substr(kStart, suffix - kStart);
+        if (kStr.empty()) return std::nullopt;
+        long long sign = 1;
+        std::size_t p = 0;
+        if (kStr[0] == '-') { sign = -1; p = 1; }
+        if (p == kStr.size()) return std::nullopt;
+        long long K = 0;
+        for (; p < kStr.size(); ++p) {
+            char c = kStr[p];
+            if (c < '0' || c > '9') return std::nullopt;
+            K = K * 10 + (c - '0');
+        }
+        return std::make_tuple(std::string{xExpr}, sign * K, targetOff);
+    };
+
+    struct Arm { long long K; std::size_t openerIdx; std::size_t closerIdx; };
+
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size());
+    bool changed = false;
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        auto first = tryParseEqOpener(stmts[i].body);
+        if (!first) { out.push_back(stmts[i]); ++i; continue; }
+        std::size_t firstCloser = matchCloser(i);
+        if (firstCloser == SIZE_MAX) { out.push_back(stmts[i]); ++i; continue; }
+
+        std::string xExpr = first->first;
+        std::vector<Arm> arms;
+        arms.push_back({first->second, i, firstCloser});
+
+        // Greedily collect contiguous `if (pstat[X] == K') { body }` arms.
+        std::size_t cursor = firstCloser + 1;
+        while (cursor < stmts.size()) {
+            auto p = tryParseEqOpener(stmts[cursor].body);
+            if (!p || p->first != xExpr) break;
+            bool dupKey = false;
+            for (const auto& a : arms) if (a.K == p->second) { dupKey = true; break; }
+            if (dupKey) break;
+            std::size_t cIdx = matchCloser(cursor);
+            if (cIdx == SIZE_MAX) break;
+            arms.push_back({p->second, cursor, cIdx});
+            cursor = cIdx + 1;
+        }
+
+        if (arms.size() < 2) { out.push_back(stmts[i]); ++i; continue; }
+
+        // Optional trailing inverse arm: `if (pstat[X] != K_else) goto L; body...; L:`.
+        bool hasElse = false;
+        long long elseK = 0;
+        std::size_t elseIfIdx = SIZE_MAX;
+        std::size_t elseBodyEnd = SIZE_MAX;   // exclusive: last body stmt index + 1
+        if (cursor < stmts.size()) {
+            auto neq = tryParseNeqGoto(stmts[cursor].body);
+            if (neq && std::get<0>(*neq) == xExpr) {
+                bool dupKey = false;
+                for (const auto& a : arms) if (a.K == std::get<1>(*neq)) { dupKey = true; break; }
+                if (!dupKey) {
+                    int targetOff = std::get<2>(*neq);
+                    // Walk forward until we find a stmt whose offset equals targetOff.
+                    // Bail if any body item has a non-zero brace delta (we don't
+                    // want to absorb a block that opens but doesn't close inside
+                    // the else body), or if any intermediate offset is itself a
+                    // label (would mean a goto from outside lands in the else
+                    // body -- unsafe to fold).
+                    int depth = 0;
+                    std::size_t k;
+                    bool labelInBody = false;
+                    for (k = cursor + 1; k < stmts.size(); ++k) {
+                        if (static_cast<int>(stmts[k].offset) == targetOff && depth == 0) break;
+                        if (depth == 0 && secLabels.count(static_cast<int>(stmts[k].offset))) {
+                            labelInBody = true;
+                            break;
+                        }
+                        depth += braceDelta(stmts[k].body);
+                        if (depth < 0) { labelInBody = true; break; }
+                    }
+                    if (!labelInBody && k < stmts.size() && depth == 0) {
+                        hasElse = true;
+                        elseK = std::get<1>(*neq);
+                        elseIfIdx = cursor;
+                        elseBodyEnd = k;
+                    }
+                }
+            }
+        }
+
+        // Emit the switch DecodedInstrs.
+        std::string sw = "switch pstat[";
+        sw += xExpr;
+        sw += "] {";
+        out.push_back({stmts[i].offset, 0, std::move(sw)});
+
+        for (const auto& a : arms) {
+            std::string armOpen = toDec(a.K);
+            armOpen += " => {";
+            out.push_back({stmts[a.openerIdx].offset, 0, std::move(armOpen)});
+            for (std::size_t k = a.openerIdx + 1; k < a.closerIdx; ++k) {
+                out.push_back(stmts[k]);
+            }
+            out.push_back({stmts[a.closerIdx].offset, 0, "}"});
+        }
+
+        if (hasElse) {
+            std::string armOpen = "else ";
+            armOpen += toDec(elseK);
+            armOpen += " => {";
+            out.push_back({stmts[elseIfIdx].offset, 0, std::move(armOpen)});
+            for (std::size_t k = elseIfIdx + 1; k < elseBodyEnd; ++k) {
+                out.push_back(stmts[k]);
+            }
+            // Closer's offset must NOT equal stmts[elseBodyEnd].offset --
+            // that offset is L12 (still a label, since it has other refs we
+            // can't absorb).  Using the inverse-if's own offset is safe:
+            // it's an instruction-start offset, not a label target.
+            out.push_back({stmts[elseIfIdx].offset, 0, "}"});
+        }
+
+        out.push_back({hasElse ? stmts[elseIfIdx].offset
+                               : stmts[arms.back().closerIdx].offset,
+                       0, "}"});
+
+        changed = true;
+        i = hasElse ? elseBodyEnd : (arms.back().closerIdx + 1);
+    }
+
+    stmts = std::move(out);
+    return changed;
+}
+
+// Catch the do-while shape that beautifyLoopsOnce misses: a single-entry
+// label L whose only back-edge lives INSIDE an if-block (rather than at the
+// scope's top level).  Pattern:
+//
+//   L:
+//     body          ← runs every iteration
+//     if (cond) {
+//       body2       ← runs only when cond was true
+//       goto L
+//     }
+//
+// Rewrite to the natural form:
+//
+//   loop {
+//     body
+//     if (negate(cond)) break;
+//     body2
+//   }
+//
+// Byte-identical: `if (X) break;` inside `loop {}` substitutes break to
+// goto __loop_end_N and encodes as ONE 0x19 opcode (two-target conditional
+// jump with elseLabel=sentinel).  Original encoded the same way -- one 0x19
+// for the if-skip, then body2, then the back-edge goto -- and our rewrite
+// keeps the same opcode sequence: one 0x19 + body2 + implicit back-edge from
+// the loop close.
+bool beautifyDoWhileOnce(std::vector<DecodedInstr>& stmts,
+                         std::unordered_set<int>& secLabels,
+                         const std::unordered_set<int>& crossSecRefs) {
+    std::unordered_map<int, std::vector<std::size_t>> sameSecRefs;
+    for (std::size_t k = 0; k < stmts.size(); ++k) {
+        std::vector<int> refs;
+        collectSameSecLabelRefs(stmts[k].body, refs);
+        for (int off : refs) sameSecRefs[off].push_back(k);
+    }
+
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size() + 4);
+    bool changed = false;
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        bool matched = false;
+        do {
+            int oxOff = static_cast<int>(stmts[i].offset);
+            if (oxOff == 0) break;
+            if (!secLabels.count(oxOff)) break;
+
+            auto refsIt = sameSecRefs.find(oxOff);
+            if (refsIt == sameSecRefs.end()) break;
+
+            // Find the unique back-edge: exactly one ref at index > i.
+            // Forward refs (k < i) and cross-section refs are fine -- we
+            // preserve the label for them; only the back-edge needs to
+            // disappear into the loop close.
+            std::size_t B = SIZE_MAX;
+            for (auto k : refsIt->second) {
+                if (k <= i) continue;
+                if (B != SIZE_MAX) { B = SIZE_MAX - 1; break; }
+                B = k;
+            }
+            if (B == SIZE_MAX || B == SIZE_MAX - 1) break;
+            if (B + 1 >= stmts.size()) break;
+            if (!isUnconditionalGotoTo(stmts[B].body, oxOff)) break;
+
+            // Walk i..B-1 tracking brace depth; find the if-block opener
+            // at depth 0 that immediately encloses B.
+            int depth = 0;
+            std::size_t O = SIZE_MAX;
+            for (std::size_t k = i; k < B; ++k) {
+                std::string_view body = stmts[k].body;
+                if (body == "}") {
+                    --depth;
+                } else if (body == "} else {") {
+                    // net zero
+                } else if (!body.empty() && body.back() == '{') {
+                    if (depth == 0 && startsWith(body, "if (")) {
+                        O = k;
+                    }
+                    ++depth;
+                }
+            }
+            if (depth != 1) break;        // B must be inside exactly one open brace
+            if (O == SIZE_MAX) break;     // and that brace must be an if-opener
+
+            // Back-edge must be the LAST stmt before the if-close.
+            if (stmts[B + 1].body != "}") break;
+
+            // Extract cond from "if (<cond>) {".
+            std::string_view opener = stmts[O].body;
+            if (opener.size() < 7) break;
+            if (opener.compare(opener.size() - 2, 2, " {") != 0) break;
+            if (opener[opener.size() - 3] != ')') break;
+            std::string_view cond = opener.substr(4, opener.size() - 3 - 4);
+
+            std::string negCond;
+            try {
+                negCond = predneg::negatePredicate(cond);
+            } catch (...) {
+                break;
+            }
+
+            out.push_back({stmts[i].offset, 0, "loop {"});
+            for (std::size_t k = i; k < O; ++k) out.push_back(stmts[k]);
+            std::string brkLine = "if (";
+            brkLine += negCond;
+            brkLine += ") break";
+            out.push_back({stmts[O].offset, stmts[O].consumed, std::move(brkLine)});
+            for (std::size_t k = O + 1; k < B; ++k) out.push_back(stmts[k]);
+            out.push_back({stmts[B].offset, stmts[B].consumed, "}"});
+            // Skip stmts[B+1] (the if-close, consumed=0) -- the loop `}` replaces it.
+
+            // Erase the label only if the back-edge B was its sole ref AND it
+            // has no cross-section refs.  Otherwise keep it: forward entries
+            // need it to resolve, and they'll render as `L<n>:` immediately
+            // before `loop {`.
+            bool otherRefs = crossSecRefs.count(oxOff) > 0;
+            if (!otherRefs) {
+                for (auto k : refsIt->second) {
+                    if (k != B) { otherRefs = true; break; }
+                }
+            }
+            if (!otherRefs) secLabels.erase(oxOff);
+            changed = true;
+            i = B + 2;
+            matched = true;
+        } while (false);
+
+        if (!matched) {
+            out.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    stmts = std::move(out);
+    return changed;
+}
+
+// For every goto-form stmt body that targets a label at the INNERMOST
+// enclosing break-scope's close offset, rewrite the `goto L_<hex>` to
+// `break`.  The bytes are identical because `break;` lowers to
+// `goto __scope_end__;` (same byte target).  This captures the "break
+// out of enclosing loop/block" pattern that the multi-pred block wrap
+// recognizer misses (it tries to introduce a NEW wrap instead of
+// reusing the existing one).
+//
+// Each opener stmt (`loop {` or bare `{`) walks forward to find its
+// matching closer; the closer's offset is the scope's "break target."
+// Non-break-scope braces (`if (...) {`, `for ... {`, `choice {`, etc.)
+// are transparent.
+//
+// After substitution, any label that loses all same-section refs and
+// has no cross-section refs is dropped from `secLabels`.
+bool beautifyImpliedBreaksOnce(std::vector<DecodedInstr>& stmts,
+                               std::unordered_set<int>& secLabels,
+                               const std::unordered_set<int>& crossSecRefs) {
+    // Precompute: for each opener stmt at index k, the offset of its
+    // matching closer (= stmts[matchingIdx].offset).
+    // Only `loop {` and bare `{` count as break-scope openers.
+    std::vector<int> closeOff(stmts.size(), -1);
+    {
+        std::vector<std::pair<std::size_t, bool>> stack; // (idx, isBreakScope)
+        for (std::size_t k = 0; k < stmts.size(); ++k) {
+            std::string_view bod = stmts[k].body;
+            bool isCloser = !bod.empty() && bod.front() == '}';
+            bool isOpener = !bod.empty() && bod.back() == '{';
+            if (isCloser) {
+                if (!stack.empty()) {
+                    auto [openIdx, isBreak] = stack.back();
+                    stack.pop_back();
+                    if (isBreak) {
+                        closeOff[openIdx] = static_cast<int>(stmts[k].offset);
+                    }
+                }
+            }
+            if (isOpener) {
+                bool isBreak = (bod == "loop {" || bod == "{");
+                stack.emplace_back(k, isBreak);
+            }
+        }
+    }
+
+    // Substitute: walk stmts, track stack of enclosing break-scope close offsets.
+    // For each stmt with a goto-form body, if the goto target equals the top of
+    // the stack, rewrite to `break`.
+    bool changed = false;
+    std::vector<int> breakStack;
+    auto sameSecGotoTargetOf = [](std::string_view body) -> int {
+        // Match body exactly "goto L_<4hex>" anywhere -- but easiest: just match
+        // the exact pattern at body content.  Handles both `goto L_<hex>` and
+        // `if (X) goto L_<hex>`.
+        std::size_t pos = body.rfind("goto L_");
+        if (pos == std::string_view::npos) return -1;
+        if (pos + 11 > body.size()) return -1;
+        // Boundary: char after the 4-hex must NOT be ident-cont.
+        if (pos + 11 < body.size() && isAsciiIdentCont(body[pos + 11])) return -1;
+        // Boundary: `L_` mustn't be preceded by `.` or ident-cont.
+        if (pos > 0 && (body[pos - 1 + 5] == '.')) return -1; // 'goto L_' — pos+5='L', body[pos+4] is space
+        // Parse 4 hex.
+        int off = 0;
+        for (int q = 0; q < 4; ++q) {
+            char c = body[pos + 7 + q];
+            if (c >= '0' && c <= '9') off = off * 16 + (c - '0');
+            else if (c >= 'a' && c <= 'f') off = off * 16 + (c - 'a' + 10);
+            else return -1;
+        }
+        return off;
+    };
+    for (std::size_t k = 0; k < stmts.size(); ++k) {
+        std::string_view bod = stmts[k].body;
+        bool isCloser = !bod.empty() && bod.front() == '}';
+        bool isOpener = !bod.empty() && bod.back() == '{';
+        if (isCloser) {
+            if (!breakStack.empty()) breakStack.pop_back();
+        }
+        // Check goto-form
+        if (!isCloser && !isOpener && !breakStack.empty()) {
+            int target = sameSecGotoTargetOf(stmts[k].body);
+            if (target != -1 && target == breakStack.back()) {
+                // Substitute `goto L_<hex>` -> `break` in this body.
+                char hexBuf[5];
+                std::snprintf(hexBuf, sizeof(hexBuf), "%04x", target);
+                std::string needle = "goto L_";
+                needle += hexBuf;
+                std::string newBody;
+                newBody.reserve(stmts[k].body.size());
+                std::size_t i = 0;
+                const auto& s = stmts[k].body;
+                while (i < s.size()) {
+                    if (i + needle.size() <= s.size()
+                        && s.compare(i, needle.size(), needle) == 0
+                        && (i + needle.size() == s.size()
+                            || !isAsciiIdentCont(s[i + needle.size()]))) {
+                        newBody += "break";
+                        i += needle.size();
+                    } else {
+                        newBody += s[i++];
+                    }
+                }
+                if (newBody != stmts[k].body) {
+                    stmts[k].body = std::move(newBody);
+                    changed = true;
+                }
+            }
+        }
+        if (isOpener) {
+            int c = closeOff[k];
+            if (c != -1) breakStack.push_back(c);
+        }
+    }
+
+    // Recount refs per label.  Drop labels that now have zero same-section refs
+    // AND no cross-section refs.
+    if (changed) {
+        std::unordered_map<int, int> refCount;
+        for (const auto& s : stmts) {
+            std::vector<int> refs;
+            collectSameSecLabelRefs(s.body, refs);
+            for (int off : refs) ++refCount[off];
+        }
+        std::vector<int> toErase;
+        for (int lbl : secLabels) {
+            if (crossSecRefs.count(lbl)) continue;
+            if (refCount[lbl] == 0) toErase.push_back(lbl);
+        }
+        for (int lbl : toErase) secLabels.erase(lbl);
+    }
+    return changed;
+}
+
+// Collapse the corpus's 4-instruction "if-else-goto" pattern back into a
+// single source statement.  The post-`beautifyIfBlocksOnce` shape is:
+//
+//   if (X) {
+//     goto A;
+//     goto B;
+//   }
+//   goto B;
+//
+// (where the second body goto's target matches the trailing goto's target.)
+// We rewrite this five-stmt span into a single stmt:
+//
+//   if (X) goto A; else goto B;
+//
+// The assembler's pull-loop expander lowers `; else goto` back to the same
+// 4-instruction byte sequence we recognized here.  No new keyword; reuses
+// the existing `; else goto` grammar that was previously unreachable in
+// the corpus.
+bool beautifyIfElseGotoOnce(std::vector<DecodedInstr>& stmts) {
+    if (stmts.size() < 5) return false;
+    bool changed = false;
+    std::vector<DecodedInstr> out;
+    out.reserve(stmts.size());
+    std::size_t i = 0;
+    while (i < stmts.size()) {
+        bool matched = false;
+        do {
+            if (i + 4 >= stmts.size()) break;
+            std::string_view ifBody = stmts[i].body;
+            if (ifBody.size() < 6 || !startsWith(ifBody, "if (") || ifBody.back() != '{') break;
+            // body[0]: goto A
+            std::string_view b0 = stmts[i + 1].body;
+            if (b0.size() != 11 || !startsWith(b0, "goto L_")) break;
+            // body[1]: goto B
+            std::string_view b1 = stmts[i + 2].body;
+            if (b1.size() != 11 || !startsWith(b1, "goto L_")) break;
+            // close `}`
+            if (stmts[i + 3].body != "}") break;
+            // following stmt: goto B (matching target)
+            std::string_view tail = stmts[i + 4].body;
+            if (tail.size() != 11 || !startsWith(tail, "goto L_")) break;
+            if (b1 != tail) break;   // inner-second target must match outer target
+
+            // Build the merged source: `if (X) goto A; else goto B;`.
+            // Strip leading "if (" (4 chars) and trailing ") {" (3 chars).
+            std::string cond{ifBody.substr(4, ifBody.size() - 4 - 3)};
+            std::string newBody = "if (";
+            newBody += cond;
+            newBody += ") ";
+            newBody += std::string{b0};   // "goto L_<hex>"
+            newBody += "; else ";
+            newBody += std::string{tail}; // "goto L_<hex>"
+
+            std::size_t totalConsumed = stmts[i].consumed
+                                      + stmts[i + 1].consumed
+                                      + stmts[i + 2].consumed
+                                      + stmts[i + 3].consumed
+                                      + stmts[i + 4].consumed;
+            out.push_back({stmts[i].offset, totalConsumed, std::move(newBody)});
+            i += 5;
+            matched = true;
+            changed = true;
+        } while (false);
+        if (!matched) {
+            out.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    stmts = std::move(out);
+    return changed;
+}
+
+// Collapse multi-predecessor forward-merge labels into bare `{ ... break; ... }`
+// blocks.  The recognizer:
+//   - Finds label Lend with refCount >= 2 (multi-predecessor).
+//   - Verifies all refs are at stmt indices < decl_idx (forward jumps only).
+//   - Verifies no cross-section refs (we're going to drop the label).
+//   - Picks scope_start_idx: the stmt index of the nearest label decl
+//     PRIOR to the earliest ref, or 0 if none.  This bounds the block.
+//   - Wraps [scope_start_idx, decl_idx) in synthetic `{`/`}` markers.
+//   - Rewrites in-range body refs of the form `goto L_<hex>` (for Lend) to
+//     `break` -- the assembler's bare-`{}` machinery re-emits `goto Lend`
+//     bytes via `__block_end_<id>` substitution.
+//
+// Returns true on the first match.  Caller loops until false to iterate.
+bool beautifyBlocksOnce(std::vector<DecodedInstr>& stmts,
+                        std::unordered_set<int>& secLabels,
+                        const std::unordered_set<int>& crossSecRefs) {
+    if (stmts.empty()) return false;
+
+    // refIndices[label_off] -> list of stmts indices referencing that label.
+    std::unordered_map<int, std::vector<std::size_t>> refIndices;
+    for (std::size_t i = 0; i < stmts.size(); ++i) {
+        std::vector<int> refs;
+        collectSameSecLabelRefs(stmts[i].body, refs);
+        for (int off : refs) refIndices[off].push_back(i);
+    }
+
+    // Try each labeled offset (smallest first -- inner blocks before outer).
+    std::vector<int> labelOffs(secLabels.begin(), secLabels.end());
+    std::sort(labelOffs.begin(), labelOffs.end());
+
+    // Track which offsets have already been wrapped via a synthetic `}`
+    // marker.  Skip them on subsequent passes -- a kept-due-to-unsafe-refs
+    // label would otherwise re-trigger forever.
+    std::unordered_set<int> alreadyWrapped;
+    for (const auto& s : stmts) {
+        if (s.body == "}") alreadyWrapped.insert(static_cast<int>(s.offset));
+    }
+
+    for (int lend_off : labelOffs) {
+        if (crossSecRefs.count(lend_off)) continue;
+        if (alreadyWrapped.count(lend_off)) continue;
+        auto rit = refIndices.find(lend_off);
+        if (rit == refIndices.end() || rit->second.size() < 2) continue;
+        const auto& refs = rit->second;
+
+        // decl_idx: stmts index where stmt.offset == lend_off.
+        std::size_t decl_idx = SIZE_MAX;
+        for (std::size_t k = 0; k < stmts.size(); ++k) {
+            if (static_cast<int>(stmts[k].offset) == lend_off) {
+                decl_idx = k;
+                break;
+            }
+        }
+        if (decl_idx == SIZE_MAX) continue;
+
+        // Forward-only: every ref idx < decl_idx.
+        bool all_forward = true;
+        for (std::size_t r : refs) if (r >= decl_idx) { all_forward = false; break; }
+        if (!all_forward) continue;
+
+        std::size_t min_ref = *std::min_element(refs.begin(), refs.end());
+
+        // scope_start_idx: walk backward from min_ref, respecting block
+        // markers (synthetic `{` / `}` from prior wraps) as structural
+        // boundaries.  Stop at:
+        //   (a) a `{` open at our depth -- new block starts inside this open
+        //   (b) a `}` close at our depth -- new block starts AFTER the close
+        //   (c) a label-hosting stmt at our depth (the new block hosts here)
+        //   (d) section start (scope_start_idx = 0)
+        std::size_t scope_start_idx = 0;
+        int depth = 0;
+        for (std::size_t k = min_ref; k > 0; --k) {
+            std::string_view bod = stmts[k - 1].body;
+            bool isCloser = !bod.empty() && bod.front() == '}';
+            bool isOpener = !bod.empty() && bod.back() == '{';
+            if (isCloser && depth == 0) {
+                // Prior block's close at our level -- new block starts here.
+                scope_start_idx = k;
+                break;
+            }
+            if (isCloser) ++depth;
+            if (isOpener) {
+                if (depth == 0) {
+                    // min_ref sits INSIDE this opener's scope.  Start the new
+                    // wrap AT the opener itself so the wrap encloses the inner
+                    // scope cleanly (well-nested).
+                    scope_start_idx = k - 1;
+                    break;
+                }
+                --depth;
+            }
+            // Label boundary at depth 0 (don't fire for the merge label itself).
+            int o = static_cast<int>(stmts[k - 1].offset);
+            if (depth == 0 && !isCloser && !isOpener
+                && secLabels.count(o) && o != lend_off) {
+                scope_start_idx = k - 1;
+                break;
+            }
+        }
+
+        // Verify well-nested braces across the wrap range AND classify each
+        // ref's break-scope depth.  Refs at depth 0 can safely become
+        // `break;` (lowers to `goto __block_end__` = goto lend_off).  Refs
+        // inside a nested loop or bare block (depth > 0) must STAY as raw
+        // gotos -- substituting them would target the wrong scope.  If any
+        // ref is "unsafe," we KEEP the merge label visible so the un-substituted
+        // gotos still resolve; this loses some reduction but is still progress
+        // (the safe refs are still converted).
+        std::unordered_set<std::size_t> safeRefs;
+        bool anyUnsafe = false;
+        {
+            std::vector<bool> stack;   // true = break-scope, false = transparent
+            int fd = 0;
+            bool wellNested = true;
+            std::unordered_set<std::size_t> refSet(refs.begin(), refs.end());
+            for (std::size_t k = scope_start_idx; k < decl_idx; ++k) {
+                std::string_view bod = stmts[k].body;
+                bool isCloser = !bod.empty() && bod.front() == '}';
+                bool isOpener = !bod.empty() && bod.back() == '{';
+                if (isCloser) {
+                    --fd;
+                    if (fd < 0) { wellNested = false; break; }
+                    if (!stack.empty()) stack.pop_back();
+                }
+                int curBreakDepth = 0;
+                for (bool b : stack) if (b) ++curBreakDepth;
+                if (refSet.count(k)) {
+                    if (curBreakDepth == 0) safeRefs.insert(k);
+                    else                    anyUnsafe = true;
+                }
+                if (isOpener) {
+                    bool isBreakScope = (bod == "loop {" || bod == "{");
+                    stack.push_back(isBreakScope);
+                    ++fd;
+                }
+            }
+            if (!wellNested || fd != 0) continue;
+            // Must have at least one safe ref to be worth wrapping.
+            if (safeRefs.empty()) continue;
+        }
+
+        // Don't fire if the scope would be the entire section AND there's no
+        // prior label -- that's the whole section body, not a real "block".
+        // Still allow scope_start_idx == 0 when the section's first stmt is
+        // labelled (rare but seen).
+        // Heuristic: require scope_start_idx > 0 OR an explicit label at
+        // stmt 0.  In practice we just allow both; the wrap is harmless.
+
+        // Substitution: search for `L_<4hex of lend_off>` in body text and
+        // replace `goto L_<hex>` with `break`.  Only fires on safe refs
+        // (innermost-scope depth 0); unsafe refs stay as raw gotos and the
+        // merge label is preserved so they resolve correctly.
+        char hexBuf[5];
+        std::snprintf(hexBuf, sizeof(hexBuf), "%04x", lend_off);
+        std::string labelName = std::string{"L_"} + hexBuf;
+        std::string gotoForm = "goto " + labelName;
+
+        auto subInBody = [&](std::string body) -> std::string {
+            std::string out;
+            out.reserve(body.size());
+            std::size_t i = 0;
+            while (i < body.size()) {
+                if (i + gotoForm.size() <= body.size()
+                    && body.compare(i, gotoForm.size(), gotoForm) == 0) {
+                    std::size_t after = i + gotoForm.size();
+                    bool rightOk = (after == body.size()) || !isAsciiIdentCont(body[after]);
+                    if (rightOk) {
+                        out += "break";
+                        i = after;
+                        continue;
+                    }
+                }
+                out += body[i++];
+            }
+            return out;
+        };
+
+        // Build new stmts vector.  Only safe refs get goto→break substitution;
+        // unsafe refs (inside nested break-scopes) keep their goto, and we
+        // preserve the merge label so they resolve correctly.
+        std::vector<DecodedInstr> rebuilt;
+        rebuilt.reserve(stmts.size() + 2);
+        for (std::size_t k = 0; k < scope_start_idx; ++k) {
+            rebuilt.push_back(stmts[k]);
+        }
+        // Synthetic `{` -- offset is the scope start's offset, consumed=0.
+        rebuilt.push_back({stmts[scope_start_idx].offset, 0, "{"});
+        for (std::size_t k = scope_start_idx; k < decl_idx; ++k) {
+            DecodedInstr cp = stmts[k];
+            if (safeRefs.count(k)) {
+                cp.body = subInBody(std::move(cp.body));
+            }
+            rebuilt.push_back(std::move(cp));
+        }
+        // Synthetic `}` -- at lend_off, consumed=0.
+        rebuilt.push_back({static_cast<std::size_t>(lend_off), 0, "}"});
+        for (std::size_t k = decl_idx; k < stmts.size(); ++k) {
+            rebuilt.push_back(stmts[k]);
+        }
+
+        stmts = std::move(rebuilt);
+        // Only drop the merge label when ALL refs were safely converted;
+        // otherwise unsafe gotos still need to resolve it.  The label
+        // renders BEFORE the synthetic `}` at the same offset (serializer's
+        // label-then-stmt order), giving a tidy `Lk:\n}` close.
+        if (!anyUnsafe) secLabels.erase(lend_off);
+        return true;
+    }
+    return false;
 }
 
 // Pull the value of named arg `name:` from a parsed call's arg list, e.g.
@@ -1588,22 +3943,33 @@ void serializeSection(std::vector<std::string>& out,
     }
     bool firstStmt = true;
     int  lastLabelOff = -1;
-    int  loopDepth = 0;   // # of `loop {` markers currently open
+    int  blockDepth = 0;   // # of open synthetic block markers (`loop {`, `if (..) {`)
     auto extraIndent = [&]() -> std::string {
         std::string s;
-        for (int q = 0; q < loopDepth; ++q) s += INDENT;
+        for (int q = 0; q < blockDepth; ++q) s += INDENT;
         return s;
+    };
+    auto isBlockOpener = [](std::string_view body) {
+        // Synthetic block openers emitted as standalone DecodedInstrs end in `{`.
+        // (For-range / choice / etc. emit single multi-line strings ending in `}`,
+        // so they don't trigger here.)
+        return !body.empty() && body.back() == '{';
+    };
+    auto isBlockCloser = [](std::string_view body) {
+        // Any body that starts with `}` decrements depth: plain `}`, the
+        // close-and-reopen `} else {`, or the chain merge `} else if (X) {`.
+        // The opener check (body ends with `{`) handles the reopen half.
+        return !body.empty() && body.front() == '}';
     };
     for (const auto& instr : stmts) {
         const int curOff = static_cast<int>(instr.offset);
-        // Dedup labels: synthetic loop-opener markers share their offset with
+        // Dedup labels: synthetic block-opener markers share their offset with
         // the first body instruction, but the label belongs to one place.
         const bool isLabelHere = labelOffsets.count(curOff) && curOff != lastLabelOff;
 
-        // Decrement depth BEFORE rendering the synthetic loop-close marker
-        // so the `}` aligns with its matching `loop {`.
-        const bool isLoopClose = (instr.body == "}");
-        if (isLoopClose && loopDepth > 0) --loopDepth;
+        // Decrement depth BEFORE rendering a synthetic close-shaped marker
+        // so the `}` (or `} else {`) aligns with its matching opener.
+        if (isBlockCloser(instr.body) && blockDepth > 0) --blockDepth;
 
         if (isLabelHere) {
             // Blank line before label to visually separate flow chunks
@@ -1641,9 +4007,9 @@ void serializeSection(std::vector<std::string>& out,
             }
         }
 
-        // Increment AFTER rendering the synthetic loop-open marker so the
-        // body sits one level deeper than `loop {` itself.
-        if (instr.body == "loop {") ++loopDepth;
+        // Increment AFTER rendering the synthetic block-open marker so the
+        // body sits one level deeper than the opener itself.
+        if (isBlockOpener(instr.body)) ++blockDepth;
 
         firstStmt = false;
     }
@@ -1676,17 +4042,22 @@ ScriptDisasm disasmScript(const Script& script) {
         const auto labIt = labels.find(i);
         const std::unordered_set<int> empty;
         const auto& secLabels = (labIt == labels.end()) ? empty : labIt->second;
-        beautifyChoice(stmts[i], secLabels);       // selection+textbox+wait -> choice
-        beautifySwitchToMap(stmts[i], secLabels);  // setScript+setPStat(245,_)+setBGM -> switchToMap
-        beautifyRunDigimonRoutine(stmts[i], secLabels);  // sectionOnExit+callDigimonSubroutine+waitForEntity(System) -> runDigimonRoutine
-        beautifyLoadAndSetDigimon(stmts[i], secLabels);  // loadDigimon+setDigimon (same D) -> loadAndSetDigimon
-        beautifySpeak(stmts[i], secLabels);        // (setDialogOwner+showTextbox) -> speak
-        beautifyStartBattle(stmts[i], secLabels);  // fadeOutHUD+delay+startBattle -> startBattle
+        beautifyChoice(stmts[i], secLabels);       // selection+textbox+wait -> choice (custom syntax; not in functions.dgs)
+        // Structural passes -- they recognise stream patterns (runs, ranges,
+        // arrays) that don't fit the "fixed window + literal/hole" model of
+        // genericBeautifyComposites.  They must run before the generic sweep
+        // below so the generic sweep can see the for-loops they produce.
         beautifyStatsList(stmts[i], secLabels);    // addStats/reduceStats/setStats runs
         beautifyLearnMoves(stmts[i], secLabels);   // learnMove runs -> learnMoves([...])
-        beautifyRemoveItems(stmts[i], secLabels);  // removeItem runs (uniform count) -> removeItems([...], n)
+        beautifyRemoveItems(stmts[i], secLabels);  // removeItem runs (uniform count)
         beautifyForRanges(stmts[i], secLabels);    // stride-1 same-mnemonic runs
-        beautifyForArray(stmts[i], secLabels);     // any varying-one-slot >=3 -> for x in [list]
+        // Named loop-composites (setDigimonAt, loadDigimonBatch, setDigimonBatch)
+        // run BEFORE the bare for-loop fold so a function-named form wins over
+        // an anonymous `for x in [...]` when both could apply.
+        beautifyPairLoopComposites(stmts[i], secLabels);  // for-loop composites: 1-iter Kind[] OR 2-iter (K,K)[]
+        beautifyForArray(stmts[i], secLabels);     // varying-one-slot >=3 -> for x in [list]
+        // Composite folding happens in the final sweep, after beautifyApproach
+        // has had a chance to see its unfolded look-pair / waitForEntity body.
     }
 
     // Pass 1.65: rewrite `Lx: ...; goto Lx; Ly:` goto-cycles as `loop {} break`.
@@ -1744,10 +4115,51 @@ ScriptDisasm disasmScript(const Script& script) {
     // wait/unload/reset triple) into `approach(...)`.  Runs after the loop
     // beautifier since it pattern-matches against `loop {` / `}` markers.
     for (std::size_t i = 0; i < script.sections.size(); ++i) {
-        const auto labIt = labels.find(i);
-        const std::unordered_set<int> empty;
-        const auto& secLabels = (labIt == labels.end()) ? empty : labIt->second;
+        // Need mutable access for beautifyIfBlocksOnce, which erases the
+        // closing-label entry on every successful collapse.  Sections with
+        // no labels get a temporary empty set (still valid for the const
+        // beautifies that look at it, since none of them mutate either).
+        auto& secLabels = labels[i];
         beautifyApproach(stmts[i], secLabels);
+        // Composite folding must run AFTER approach so we don't pre-consume the
+        // look-pair / waitForEntity / delay statements that the approach
+        // matcher depends on inside its 11-stmt window.
+        beautifySetObjectsVisibleRange(stmts[i], secLabels);  // for-id {setObjectVisibility} -> setObjectsVisibleRange (control-flow; bespoke)
+        // If-block collapses BEFORE composites: composites can now contain
+        // block-form `if (cond) { body }` in their function bodies, and the
+        // matcher needs to see the corpus stmts already in block form to match.
+        //
+        //   1. beautifyIfElseOnce — two-way-jump opcode form (no corpus matches
+        //      today; future authored sources may use it).
+        //   2. beautifyIfBlocksOnce — single-arm `if (cond) goto Lx; body; Lx:`.
+        //   3. beautifyIfElseFromSingleArmOnce — post-v1: turn `if (X) { body;
+        //      goto Lend; }; body_else; Lend:` back into if/else.
+        while (beautifyIfElseOnce(stmts[i], secLabels, crossSecRefs[i])) {}
+        while (beautifyIfBlocksOnce(stmts[i], secLabels, crossSecRefs[i])) {}
+        // Fold runs of `if (pstat[X] == K_i) { body }` arms into a single
+        // `switch pstat[X] { K => { body } ... }`.  Runs AFTER the if-block
+        // collapse so the arms are already in bodied form.
+        while (beautifySwitchOnce(stmts[i], secLabels)) {}
+        // do-while: conditional back-edge inside an if-block.  Runs AFTER
+        // beautifyIfBlocksOnce so the enclosing `if (cond) { ... goto L; }`
+        // shape exists.
+        while (beautifyDoWhileOnce(stmts[i], secLabels, crossSecRefs[i])) {}
+        while (beautifyIfElseFromSingleArmOnce(stmts[i], secLabels, crossSecRefs[i])) {}
+        // Collapse 4-instr if-else-goto pattern: `if (X) { goto A; goto B; } goto B;`
+        // -> `if (X) goto A; else goto B;`.  Runs AFTER the if-block beautify
+        // (which produces the post-collapse shape) and BEFORE the block recognizer
+        // (which would otherwise wrap goto B's merge label).
+        while (beautifyIfElseGotoOnce(stmts[i])) {}
+        // Multi-predecessor forward-merge labels become bare `{ ... break; ... }`
+        // blocks.  Runs AFTER the simple if-block collapses so the merge labels
+        // we're left with are genuine multi-pred merges (not just single-arm
+        // closes the if-block recognizer skipped).
+        while (beautifyBlocksOnce(stmts[i], secLabels, crossSecRefs[i])) {}
+        genericBeautifyComposites(stmts[i], secLabels);  // functions.dgs-driven: anim, sfx, speak, startBattle, finishEncounter, etc.
+        // Cosmetic chain merge: `} else { if (X) {...} }` -> `} else if (X) {...}`.
+        // Runs LAST so that any pattern composites might have consumed is already
+        // accounted for; pure rendering reshape (no byte change).
+        while (beautifyElseIfChainOnce(stmts[i])) {}
     }
 
     // Pass 1.75: assign sequential per-section label names (L1, L2, ...) in

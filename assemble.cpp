@@ -1,6 +1,7 @@
 #include "assemble.hpp"
 #include "char-map.hpp"
 #include "opcodes.hpp"
+#include "predicate_neg.hpp"
 #include "symbols.hpp"
 #include "targets.hpp"
 
@@ -38,14 +39,40 @@ struct LocalSymsScope {
     ~LocalSymsScope() { g_localSyms = prev; }
 };
 
-// Accept decimal/hex, `<Kind>.<Name>` qualified refs, or -- when
-// `expectedKind` is provided -- a bare name resolved in that kind via the
-// current local-then-global symbol scope.
+// Accept decimal/hex, `<Kind>.<Name>` qualified refs, `:Name` shorthand
+// resolved in the `expectedKind` scope, `<Kind>(N)` explicit-cast literals
+// (parses to the integer N; round-trip emission for unnamed typed slots),
+// or -- when `expectedKind` is provided -- a bare name resolved in that
+// kind via the current local-then-global symbol scope.
 int parseNumOrSym(std::string_view s,
                   std::optional<SymKind> expectedKind = std::nullopt) {
     s = trim(s);
     if (!s.empty()) {
         char c0 = s[0];
+        if (c0 == ':' && expectedKind) {
+            int v;
+            if (lookupBareNameInScope(g_localSyms, *expectedKind, s.substr(1), v)) {
+                return v;
+            }
+            throw std::runtime_error(std::string{"unknown :"} + std::string{s.substr(1)}
+                + " in kind `" + std::string{symKindLabel(*expectedKind)} + "`");
+        }
+        if ((c0 >= 'A' && c0 <= 'Z') && s.back() == ')') {
+            std::size_t lp = s.find('(');
+            if (lp != std::string_view::npos) {
+                std::string_view kindTok = trim(s.substr(0, lp));
+                std::string_view inner   = trim(s.substr(lp + 1, s.size() - lp - 2));
+                if (auto k = symKindFromLabel(kindTok)) {
+                    if (expectedKind && *k != *expectedKind) {
+                        throw std::runtime_error(
+                            std::string{"kind mismatch: expected `"}
+                            + std::string{symKindLabel(*expectedKind)}
+                            + "`, got `" + std::string{symKindLabel(*k)} + "(...)`");
+                    }
+                    return parseNumOrSym(inner, k);
+                }
+            }
+        }
         if ((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_') {
             int v;
             if (s.find('.') != std::string_view::npos) {
@@ -586,7 +613,45 @@ struct ExprParser {
         if (isIdentStart(c)) {
             std::size_t st = p++;
             while (p < s.size() && isIdentCont(s[p])) ++p;
-            std::string name{s.substr(st, p - st)};
+            std::string_view ident = s.substr(st, p - st);
+
+            // `Kind.Name` -- resolve via the global symbol table.
+            if (p < s.size() && s[p] == '.') {
+                std::size_t nst = ++p;
+                while (p < s.size() && isIdentCont(s[p])) ++p;
+                std::string_view nm = s.substr(nst, p - nst);
+                auto k = symKindFromLabel(ident);
+                if (!k) {
+                    throw std::runtime_error("const expr: unknown kind `"
+                        + std::string{ident} + "`");
+                }
+                int v;
+                if (!lookupBareNameInScope(g_localSyms, *k, nm, v)) {
+                    throw std::runtime_error("const expr: unknown "
+                        + std::string{ident} + "." + std::string{nm});
+                }
+                return v;
+            }
+            // `Kind(N)` -- explicit-cast literal; recursively parse the inner
+            // expression so `Trigger(707)..Trigger(713)` works as a range and
+            // `Trigger(BASE + 1)` works once BASE is a const.
+            skipWS();
+            if (p < s.size() && s[p] == '(') {
+                if (auto k = symKindFromLabel(ident)) {
+                    (void)k;
+                    ++p;
+                    int v = parseExpr();
+                    skipWS();
+                    if (p >= s.size() || s[p] != ')') {
+                        throw std::runtime_error("const expr: expected `)` after `"
+                            + std::string{ident} + "(...`");
+                    }
+                    ++p;
+                    return v;
+                }
+            }
+
+            std::string name{ident};
             auto it = consts->find(name);
             if (it == consts->end()) {
                 throw std::runtime_error("const expr: unknown identifier `" + name + "`");
@@ -621,6 +686,8 @@ ContainerAST parseSource(std::string_view text) {
     std::vector<std::string> pendingLabels;
     int nextSwitchId = 0;
     int nextLoopId   = 0;
+    int nextIfId     = 0;
+    int nextBlockId  = 0;
 
     // File-scope `const NAME = <expr>;` bindings, substituted into every
     // subsequent line at pull time.  `constsStr` caches the value as text
@@ -647,6 +714,18 @@ ContainerAST parseSource(std::string_view text) {
         std::string name;
         std::optional<SymKind> kind;
         bool isArray = false;
+        // When `kind2` is set, this is a pair-array param of type
+        // `(kind, kind2)[]`.  The accepted literal form is a `[K=>V, ...]`
+        // list; each K resolves in `kind`, each V in `kind2`.  The body
+        // sees the array as bracketed `[K=>V, ...]` after resolution, so
+        // a destructuring `for a, b in <param>` can pick the pairs apart.
+        std::optional<SymKind> kind2;
+        // `name: Kind = <expr>` -- omitted call-site args are filled with
+        // this raw text, which then flows through the same typed-arg
+        // resolution as an explicit literal would.  Once a param has a
+        // default, all params after it must also have one (so positional
+        // binding stays unambiguous).
+        std::optional<std::string> defaultExpr;
     };
     struct MacroDef {
         std::vector<MacroParam> params;
@@ -714,6 +793,23 @@ ContainerAST parseSource(std::string_view text) {
                 && src.size() - i >= name.size()
                 && std::memcmp(src.data() + i, name.data(), name.size()) == 0
                 && (i + name.size() == src.size() || !isIdentCont(src[i + name.size()]))) {
+                // Skip when the identifier is in a position where it shouldn't
+                // be a value:
+                //   * field-name `name:` -- `roll(pstat: slot, max: max)`
+                //     uses `max` as both a field name and a value; only the
+                //     value side should substitute, else we get `99: 99`.
+                //   * call-site `name(...)` -- a param like `delay` would
+                //     otherwise shadow the opcode wrapper `delay(...)` in the
+                //     body, yielding `<value>(...)`.  This language has no
+                //     first-class call values, so call-position never wants
+                //     parameter substitution.
+                std::size_t afterIdent = i + name.size();
+                std::size_t scan = afterIdent;
+                while (scan < src.size() && (src[scan] == ' ' || src[scan] == '\t')) ++scan;
+                if (scan < src.size() && (src[scan] == ':' || src[scan] == '(')) {
+                    out += c; ++i;
+                    continue;
+                }
                 out.append(value);
                 i += name.size();
             } else {
@@ -844,12 +940,48 @@ ContainerAST parseSource(std::string_view text) {
             for (auto p : paramTokens) {
                 std::string_view tp = trim(p);
                 if (tp.empty()) continue;
+                // `[PreferNamed]` prefix is a disasm-only annotation (emits the
+                // arg with `name:` styling at the matched call site).  Stripped
+                // here; the assembler treats the param identically either way.
+                if (startsWith(tp, "[PreferNamed]")) {
+                    tp = trim(tp.substr(std::string_view{"[PreferNamed]"}.size()));
+                }
+                // Split off `= <default>` at top level (skip `==`, `=>`, and
+                // anything nested in `[]`/`()`/`{}`).  The default text is
+                // stored raw and substituted at call sites where the param
+                // was omitted, then flows through the same resolution as an
+                // explicit literal would.
+                std::optional<std::string> defaultExpr;
+                {
+                    int bd = 0, pd = 0, cd = 0;
+                    std::size_t eq = std::string_view::npos;
+                    for (std::size_t i = 0; i < tp.size(); ++i) {
+                        char c = tp[i];
+                        if (c == '[') ++bd;
+                        else if (c == ']') --bd;
+                        else if (c == '(') ++pd;
+                        else if (c == ')') --pd;
+                        else if (c == '{') ++cd;
+                        else if (c == '}') --cd;
+                        else if (c == '=' && bd == 0 && pd == 0 && cd == 0) {
+                            char nx = (i + 1 < tp.size()) ? tp[i + 1] : '\0';
+                            char pv = (i > 0) ? tp[i - 1] : '\0';
+                            if (nx == '=' || nx == '>' || pv == '=' || pv == '!' || pv == '<' || pv == '>') continue;
+                            eq = i;
+                            break;
+                        }
+                    }
+                    if (eq != std::string_view::npos) {
+                        defaultExpr = std::string{trim(tp.substr(eq + 1))};
+                        tp = trim(tp.substr(0, eq));
+                    }
+                }
                 // `name`            -- untyped pass-through
                 // `name: Kind`      -- scalar typed (resolves to numeric)
                 // `name: Kind[]`    -- array typed (resolves each element)
                 std::size_t colon = tp.find(':');
                 if (colon == std::string_view::npos) {
-                    params.push_back({std::string{tp}, std::nullopt, false});
+                    params.push_back({std::string{tp}, std::nullopt, false, std::nullopt, defaultExpr});
                 } else {
                     std::string_view pn = trim(tp.substr(0, colon));
                     std::string_view kt = trim(tp.substr(colon + 1));
@@ -858,13 +990,59 @@ ContainerAST parseSource(std::string_view text) {
                         isArr = true;
                         kt = trim(kt.substr(0, kt.size() - 2));
                     }
-                    auto k = symKindFromLabel(kt);
-                    if (!k) {
-                        throw std::runtime_error(std::string{"function "} + mname
-                            + ": unknown kind `" + std::string{kt}
-                            + "` on param `" + std::string{pn} + "`");
+                    // `(K1, K2)` pair type -- requires the `[]` array suffix
+                    // (a non-array pair param has no expression form to bind
+                    // to, so we reject it).
+                    if (!kt.empty() && kt.front() == '(' && kt.back() == ')') {
+                        if (!isArr) {
+                            throw std::runtime_error(std::string{"function "} + mname
+                                + ": pair type `" + std::string{kt}
+                                + "` must be array (`(K1, K2)[]`) on param `"
+                                + std::string{pn} + "`");
+                        }
+                        std::string_view inner = trim(kt.substr(1, kt.size() - 2));
+                        auto pieces = splitTopCommas(inner);
+                        if (pieces.size() != 2) {
+                            throw std::runtime_error(std::string{"function "} + mname
+                                + ": pair type expects exactly 2 kinds in `("
+                                + std::string{inner} + ")`");
+                        }
+                        std::string_view ka = trim(pieces[0]);
+                        std::string_view kb = trim(pieces[1]);
+                        auto k1 = symKindFromLabel(ka);
+                        auto k2 = symKindFromLabel(kb);
+                        if (!k1 || !k2) {
+                            throw std::runtime_error(std::string{"function "} + mname
+                                + ": unknown kind in pair `(" + std::string{ka}
+                                + ", " + std::string{kb} + ")`");
+                        }
+                        params.push_back({std::string{pn}, k1, true, k2, defaultExpr});
+                    } else if (kt == "int") {
+                        params.push_back({std::string{pn}, std::nullopt, isArr, std::nullopt, defaultExpr});
+                    } else {
+                        auto k = symKindFromLabel(kt);
+                        if (!k) {
+                            throw std::runtime_error(std::string{"function "} + mname
+                                + ": unknown kind `" + std::string{kt}
+                                + "` on param `" + std::string{pn} + "`");
+                        }
+                        params.push_back({std::string{pn}, k, isArr, std::nullopt, defaultExpr});
                     }
-                    params.push_back({std::string{pn}, k, isArr});
+                }
+            }
+            // Enforce: once a param has a default, all subsequent params
+            // must also have one.  Otherwise positional binding is ambiguous
+            // (we'd have to decide whether `foo(1, 2)` skips the defaulted
+            // middle param or fills it).
+            {
+                bool sawDefault = false;
+                for (const auto& mp : params) {
+                    if (mp.defaultExpr.has_value()) sawDefault = true;
+                    else if (sawDefault) {
+                        throw std::runtime_error(std::string{"function "} + mname
+                            + ": param `" + mp.name
+                            + "` has no default but follows a defaulted param");
+                    }
                 }
             }
             std::string rRest{trim(r.substr(rp + 1))};
@@ -1068,11 +1246,47 @@ ContainerAST parseSource(std::string_view text) {
             && (line.size() == 6 || line[6] == ' ' || line[6] == '\t')) {
             std::string_view r0 = trim(line.substr(6));
             if (!r0.empty() && r0[0] != '(') {
-                std::string_view ident = leadingIdent(r0);
-                if (ident.empty()) {
-                    throw std::runtime_error("switch: expected pstat identifier or `(` expression");
+                // Scrutinee accepts three forms:
+                //   `pstat[<expr>]`  -- explicit (preferred; matches the
+                //                       corpus's eq-chain `if (pstat[...])` shape)
+                //   `<ident>`        -- wrapped as `pstat[<ident>]`
+                //   `<integer>`      -- wrapped as `pstat[<integer>]`
+                // The captured value `ident` is the expression *inside* the
+                // brackets -- it's interpolated into `pstat[<ident>]` later.
+                std::string_view identView = leadingIdent(r0);
+                std::size_t consumed = 0;
+                if (!identView.empty() && identView == "pstat") {
+                    std::size_t i = identView.size();
+                    while (i < r0.size() && (r0[i] == ' ' || r0[i] == '\t')) ++i;
+                    if (i >= r0.size() || r0[i] != '[') {
+                        throw std::runtime_error("switch: expected `[` after `pstat`");
+                    }
+                    std::size_t lb2 = i;
+                    std::size_t rb2 = r0.find(']', lb2);
+                    if (rb2 == std::string_view::npos) {
+                        throw std::runtime_error("switch: unterminated `pstat[...]`");
+                    }
+                    identView = trim(r0.substr(lb2 + 1, rb2 - lb2 - 1));
+                    if (identView.empty()) {
+                        throw std::runtime_error("switch: empty `pstat[]` index");
+                    }
+                    consumed = rb2 + 1;
+                } else if (!identView.empty()) {
+                    consumed = identView.size();
+                } else {
+                    // Bare integer pstat index (e.g. `switch 117 { ... }`).
+                    std::size_t n = 0;
+                    while (n < r0.size() && r0[n] >= '0' && r0[n] <= '9') ++n;
+                    if (n == 0) {
+                        throw std::runtime_error("switch: expected `pstat[...]`, identifier, integer, or `(` expression");
+                    }
+                    identView = r0.substr(0, n);
+                    consumed = n;
                 }
-                std::string_view rest = trim(r0.substr(ident.size()));
+                // pullLine() below invalidates views into the original line;
+                // copy out before any pulls happen.
+                std::string ident{identView};
+                std::string_view rest = trim(r0.substr(consumed));
                 if (rest.empty() || rest[0] != '{') {
                     // `{` might be on the next line.
                     while (rest.empty() || rest[0] != '{') {
@@ -1103,22 +1317,56 @@ ContainerAST parseSource(std::string_view text) {
                     }
                 }
 
-                // Parse cases: `<key> -> { <body> }` separated by ws/;/,
-                struct Case { std::string key; std::string body; };
+                // Parse cases.  Two arrow forms:
+                //   `<key> -> { <body> }`  -- 0x18 jumptable (positional 0..N-1)
+                //   `<key> => { <body> }`  -- 0x19 eq-chain (arbitrary keys)
+                //   `else <key> => { <body> }` -- last-arm marker for eq-chain
+                //     (purely visual; emits same bytes as a regular `=>` arm)
+                // A single switch must use one arrow type throughout.
+                struct Case { std::string key; std::string body; bool isElse; };
                 std::vector<Case> cases;
+                bool isFatMode = false;
+                bool committedArrow = false;
                 std::size_t p = 0;
                 auto isWS = [](char c){ return c==' '||c=='\t'||c=='\n'||c=='\r'; };
                 while (p < blockBody.size()) {
                     while (p < blockBody.size() && (isWS(blockBody[p]) || blockBody[p]==';' || blockBody[p]==',')) ++p;
                     if (p >= blockBody.size()) break;
+
+                    bool isElse = false;
+                    if (p + 4 <= blockBody.size()
+                        && blockBody.compare(p, 4, "else") == 0
+                        && (p + 4 == blockBody.size() || isWS(blockBody[p+4]))) {
+                        isElse = true;
+                        p += 4;
+                        while (p < blockBody.size() && isWS(blockBody[p])) ++p;
+                    }
+
                     std::size_t kStart = p;
-                    if (blockBody[p] == '-') ++p;
+                    if (p < blockBody.size() && blockBody[p] == '-') ++p;
                     while (p < blockBody.size() && blockBody[p] >= '0' && blockBody[p] <= '9') ++p;
                     std::string key{blockBody.substr(kStart, p - kStart)};
                     if (key.empty()) throw std::runtime_error("switch: expected case key");
                     while (p < blockBody.size() && isWS(blockBody[p])) ++p;
-                    if (p + 1 >= blockBody.size() || blockBody[p] != '-' || blockBody[p+1] != '>') {
-                        throw std::runtime_error("switch: expected `->` after case key");
+                    if (p + 1 >= blockBody.size()) {
+                        throw std::runtime_error("switch: expected `->` or `=>` after case key");
+                    }
+                    bool armIsFat;
+                    if (blockBody[p] == '-' && blockBody[p+1] == '>') {
+                        armIsFat = false;
+                    } else if (blockBody[p] == '=' && blockBody[p+1] == '>') {
+                        armIsFat = true;
+                    } else {
+                        throw std::runtime_error("switch: expected `->` or `=>` after case key");
+                    }
+                    if (!committedArrow) {
+                        committedArrow = true;
+                        isFatMode = armIsFat;
+                    } else if (armIsFat != isFatMode) {
+                        throw std::runtime_error("switch: cannot mix `->` and `=>` arrows in one switch");
+                    }
+                    if (isElse && !armIsFat) {
+                        throw std::runtime_error("switch: `else` only allowed with `=>` arrows");
                     }
                     p += 2;
                     while (p < blockBody.size() && isWS(blockBody[p])) ++p;
@@ -1133,15 +1381,48 @@ ContainerAST parseSource(std::string_view text) {
                         else if (blockBody[p] == '}') { d--; if (d == 0) break; }
                         ++p;
                     }
-                    cases.push_back({ std::move(key), blockBody.substr(bStart, p - bStart) });
+                    cases.push_back({ std::move(key), blockBody.substr(bStart, p - bStart), isElse });
                     if (p < blockBody.size()) ++p; // skip `}`
+                }
+
+                for (std::size_t k = 0; k + 1 < cases.size(); ++k) {
+                    if (cases[k].isElse) throw std::runtime_error("switch: `else` arm must be last");
                 }
 
                 int swId = nextSwitchId++;
                 std::string idTag = std::to_string(swId);
                 std::vector<std::string> expanded;
 
-                // Build the dispatch line.
+                if (isFatMode) {
+                    // Eq-chain (0x19) lowering: each arm becomes a bodied-if
+                    // `if (pstat[ident] == K) { body }`.  The bodied-if parser
+                    // takes it from there; bytes match a hand-written eq-chain.
+                    // `else K =>` is treated identically -- it's a visual marker
+                    // for "this is the catch-all"; bytes are the same because the
+                    // last arm's bypass label naturally lands at the section's
+                    // post-switch continuation.
+                    for (const auto& c : cases) {
+                        std::string line = "if (pstat[";
+                        line += std::string{ident};
+                        line += "] == ";
+                        line += c.key;
+                        line += ") {";
+                        expanded.push_back(std::move(line));
+                        for (auto piece : splitTopSemis(c.body)) {
+                            std::string_view tp = trim(piece);
+                            if (tp.empty()) continue;
+                            expanded.emplace_back(std::string{tp} + ";");
+                        }
+                        expanded.push_back("}");
+                    }
+
+                    for (auto it = expanded.rbegin(); it != expanded.rend(); ++it) {
+                        pendingLines.push_front(PendingLine{std::move(*it), originFile, originLine});
+                    }
+                    continue;
+                }
+
+                // Jumptable (0x18) lowering -- the original block-bodied form.
                 {
                     std::string h = "switch (pstat[";
                     h += std::string{ident};
@@ -1156,19 +1437,12 @@ ContainerAST parseSource(std::string_view text) {
                     expanded.push_back(std::move(h));
                 }
 
-                // Emit each case body bracketed by its label and a goto-end.
-                // Statements inside the case body may be separated by either
-                // newlines or top-level `;`; we normalize to one line per stmt.
                 std::string endLabel = "__sw" + idTag + "_end";
                 for (std::size_t k = 0; k < cases.size(); ++k) {
                     expanded.push_back("__sw" + idTag + "_case" + std::to_string(k) + ":");
-                    // First flatten newlines (keep top-level brace tracking out of
-                    // play -- case bodies have no nested structure that depends on
-                    // newlines beyond comments, which we strip per-line).
                     for (auto piece : splitTopSemis(cases[k].body)) {
                         std::string_view tp = trim(piece);
                         if (tp.empty()) continue;
-                        // Skip a leftover label-decl-like line ("foo:") with no body.
                         expanded.emplace_back(std::string{tp} + ";");
                     }
                     expanded.push_back("goto " + endLabel + ";");
@@ -1236,14 +1510,22 @@ ContainerAST parseSource(std::string_view text) {
             std::string startLabel = "_loop_start_" + std::to_string(id);
             std::string endLabel   = "_loop_end_"   + std::to_string(id);
 
-            // Substitute `break` / `continue` at our enclosing-loop scope
-            // (i.e. not inside a nested `loop {`).  Other braces are
-            // transparent.  String literals and `//` comments are skipped.
+            // Substitute `break` / `continue` at our enclosing-loop scope.
+            // Brace scoping is two-axis: a nested `loop {` is BOTH a break
+            // and a continue scope (intercepts both); a nested bare `{` is
+            // a break scope only (intercepts break but lets continue pass
+            // through to the outer loop).  Other braces are transparent.
+            // String literals and `//` comments are skipped.
             std::string subBody;
             subBody.reserve(body.size());
-            std::vector<bool> loopBraces;
-            auto inNestedLoop = [&]() {
-                for (bool b : loopBraces) if (b) return true;
+            // Each entry: bit 0 = break-scope, bit 1 = continue-scope.
+            std::vector<unsigned char> braceScope;
+            auto inBreakScope = [&]() {
+                for (unsigned char b : braceScope) if (b & 1) return true;
+                return false;
+            };
+            auto inContinueScope = [&]() {
+                for (unsigned char b : braceScope) if (b & 2) return true;
                 return false;
             };
             bool inStr = false;
@@ -1261,21 +1543,29 @@ ContainerAST parseSource(std::string_view text) {
                     continue;
                 }
                 if (c == '{') {
-                    // Detect `loop {` by looking back at the preceding token.
+                    // Classify the brace:
+                    //   loop `{`: break-scope AND continue-scope (intercepts both)
+                    //   bare `{`: break-scope only (continue passes through)
+                    //   other  : transparent
                     std::size_t e = i;
-                    while (e > 0 && (body[e - 1] == ' ' || body[e - 1] == '\t'
-                                  || body[e - 1] == '\n' || body[e - 1] == '\r')) --e;
+                    while (e > 0 && (body[e - 1] == ' ' || body[e - 1] == '\t')) --e;
+                    bool isBareBrace = (e == 0 || body[e - 1] == '\n' || body[e - 1] == '\r');
+                    std::size_t e2 = e;
+                    while (e2 > 0 && (body[e2 - 1] == '\n' || body[e2 - 1] == '\r')) --e2;
                     bool isLoopBrace = false;
-                    if (e >= 4 && body.compare(e - 4, 4, "loop") == 0
-                        && (e == 4 || !isIdentCont(body[e - 5]))) {
+                    if (e2 >= 4 && body.compare(e2 - 4, 4, "loop") == 0
+                        && (e2 == 4 || !isIdentCont(body[e2 - 5]))) {
                         isLoopBrace = true;
                     }
-                    loopBraces.push_back(isLoopBrace);
+                    unsigned char flags = 0;
+                    if (isLoopBrace) flags = 3;       // break + continue
+                    else if (isBareBrace) flags = 1;  // break only
+                    braceScope.push_back(flags);
                     subBody += c;
                     ++i; continue;
                 }
                 if (c == '}') {
-                    if (!loopBraces.empty()) loopBraces.pop_back();
+                    if (!braceScope.empty()) braceScope.pop_back();
                     subBody += c;
                     ++i; continue;
                 }
@@ -1284,14 +1574,14 @@ ContainerAST parseSource(std::string_view text) {
                     while (j < body.size() && isIdentCont(body[j])) ++j;
                     std::string_view tok = std::string_view{body}.substr(i, j - i);
                     bool leftOk = (i == 0) || !isIdentCont(body[i - 1]);
-                    if (leftOk && !inNestedLoop()) {
-                        if (tok == "break") {
+                    if (leftOk) {
+                        if (tok == "break" && !inBreakScope()) {
                             subBody += "goto ";
                             subBody += endLabel;
                             i = j;
                             continue;
                         }
-                        if (tok == "continue") {
+                        if (tok == "continue" && !inContinueScope()) {
                             subBody += "goto ";
                             subBody += startLabel;
                             i = j;
@@ -1328,9 +1618,443 @@ ContainerAST parseSource(std::string_view text) {
             continue;
         }
 
+        // `if (X) goto A; else goto B;` -- two-way branch.  The corpus
+        // encodes this NOT as the compact 0x19-opcode-with-else-target form,
+        // but as a 4-instruction skip pattern:
+        //   IF (NEG X) -> Lend; jump A; jump B; Lend: jump B;
+        // (where the second `jump B` inside the if-body is a redundant
+        // "filler" with target == else target.)  Since the corpus has
+        // ZERO uses of the compact form, we always lower `; else goto`
+        // to the verbose corpus form.  Expand here at parse time so the
+        // encoder sees each instruction separately and offsets compute
+        // naturally.  Falls back to encodeIfStmt's compact path if the
+        // predicate negator can't handle the expression.
+        if (inSection && startsWith(line, "if ")
+            && line.find("; else goto ") != std::string_view::npos) {
+            std::size_t lp = line.find('(');
+            std::size_t rp = (lp != std::string_view::npos)
+                                 ? findMatchingRparen(line, lp)
+                                 : std::string_view::npos;
+            std::size_t semi = (rp != std::string_view::npos)
+                                   ? line.find("; else goto ", rp)
+                                   : std::string_view::npos;
+            if (rp != std::string_view::npos && semi != std::string_view::npos) {
+                std::string_view exprPart = trim(line.substr(lp + 1, rp - lp - 1));
+                std::string_view thenPart = trim(line.substr(rp + 1, semi - rp - 1));
+                std::string_view elsePart = trim(line.substr(semi + 12));  // skip "; else goto "
+                while (!elsePart.empty() && (elsePart.back() == ';' || elsePart.back() == ' ' || elsePart.back() == '\t')) {
+                    elsePart.remove_suffix(1);
+                }
+                std::string thenLabel;
+                if (startsWith(thenPart, "goto ")) {
+                    thenLabel.assign(trim(thenPart.substr(5)));
+                    // Strip trailing semicolon if any.
+                    while (!thenLabel.empty() && (thenLabel.back() == ';' || thenLabel.back() == ' ' || thenLabel.back() == '\t')) {
+                        thenLabel.pop_back();
+                    }
+                }
+                std::string elseLabel{elsePart};
+                if (!thenLabel.empty() && !elseLabel.empty()) {
+                    std::string negCond;
+                    bool negOk = false;
+                    try {
+                        negCond = predneg::negatePredicate(std::string{exprPart});
+                        negOk = true;
+                    } catch (...) {}
+                    if (negOk) {
+                        int id = nextIfId++;
+                        std::string endLabel = "__if_else_skip_" + std::to_string(id);
+                        std::vector<std::string> expanded;
+                        expanded.push_back("if (" + negCond + ") goto " + endLabel + ";");
+                        expanded.push_back("goto " + thenLabel + ";");
+                        expanded.push_back("goto " + elseLabel + ";");
+                        expanded.push_back(endLabel + ":");
+                        expanded.push_back("goto " + elseLabel + ";");
+                        for (auto it = expanded.rbegin(); it != expanded.rend(); ++it) {
+                            pendingLines.push_front(PendingLine{std::move(*it), originFile, originLine});
+                        }
+                        continue;
+                    }
+                    // Negation failed: fall through to existing encodeIfStmt
+                    // compact-form path.  (Won't match corpus bytes for the
+                    // skip pattern, but we never round-trip a non-negatable
+                    // predicate through this form anyway.)
+                }
+            }
+        }
+
+        // Bare `{ <body> }` -- break-scope (no looping).  `break;` inside
+        // the body becomes `goto __block_end_<id>;` which the close `}`
+        // anchors via a synthetic label.  Nested `loop {}` and nested
+        // bare `{}` have their own scope, so substitution skips body
+        // content inside any such inner break-scope.  Other block-bodied
+        // constructs (`if`, `for`, `choice`, `switch`, ...) are
+        // transparent -- a `break;` inside `block { if (X) { break; } }`
+        // exits the outer block, not the if.
+        if (inSection && !line.empty() && line[0] == '{') {
+            std::string body;
+            int depth = 1;
+            for (std::size_t i = 1; i < line.size(); ++i) {
+                char c = line[i];
+                if (c == '{') depth++;
+                else if (c == '}') { depth--; if (depth == 0) break; }
+                body += c;
+            }
+            while (depth > 0) {
+                if (!pullLine()) throw std::runtime_error("block: unterminated body");
+                std::string_view raw2 = current.text;
+                if (!raw2.empty() && raw2.back() == '\r') raw2.remove_suffix(1);
+                std::string_view s2 = stripLineComment(raw2);
+                body += '\n';
+                for (char c : s2) {
+                    if (c == '{') depth++;
+                    else if (c == '}') { depth--; if (depth == 0) break; }
+                    body += c;
+                }
+            }
+
+            int id = nextBlockId++;
+            std::string endLabel = "__block_end_" + std::to_string(id);
+
+            // `break;` substitution mirrors the `loop {}` machinery: skip
+            // body content inside any nested break-scope (loop or bare `{`).
+            std::string subBody;
+            subBody.reserve(body.size());
+            std::vector<bool> scopeBraces;
+            auto inNestedScope = [&]() {
+                for (bool b : scopeBraces) if (b) return true;
+                return false;
+            };
+            bool inStr = false;
+            for (std::size_t i = 0; i < body.size(); ) {
+                char c = body[i];
+                if (inStr) {
+                    subBody += c;
+                    if (c == '\\' && i + 1 < body.size()) { subBody += body[i + 1]; i += 2; continue; }
+                    if (c == '"') inStr = false;
+                    ++i; continue;
+                }
+                if (c == '"') { inStr = true; subBody += c; ++i; continue; }
+                if (c == '/' && i + 1 < body.size() && body[i + 1] == '/') {
+                    while (i < body.size() && body[i] != '\n') { subBody += body[i++]; }
+                    continue;
+                }
+                if (c == '{') {
+                    std::size_t e = i;
+                    while (e > 0 && (body[e - 1] == ' ' || body[e - 1] == '\t')) --e;
+                    bool isBareBrace = (e == 0 || body[e - 1] == '\n' || body[e - 1] == '\r');
+                    std::size_t e2 = e;
+                    while (e2 > 0 && (body[e2 - 1] == '\n' || body[e2 - 1] == '\r')) --e2;
+                    bool isLoopBrace = false;
+                    if (e2 >= 4 && body.compare(e2 - 4, 4, "loop") == 0
+                        && (e2 == 4 || !isIdentCont(body[e2 - 5]))) {
+                        isLoopBrace = true;
+                    }
+                    scopeBraces.push_back(isLoopBrace || isBareBrace);
+                    subBody += c;
+                    ++i; continue;
+                }
+                if (c == '}') {
+                    if (!scopeBraces.empty()) scopeBraces.pop_back();
+                    subBody += c;
+                    ++i; continue;
+                }
+                if (isIdentStart(c)) {
+                    std::size_t j = i;
+                    while (j < body.size() && isIdentCont(body[j])) ++j;
+                    std::string_view tok = std::string_view{body}.substr(i, j - i);
+                    bool leftOk = (i == 0) || !isIdentCont(body[i - 1]);
+                    if (leftOk && !inNestedScope() && tok == "break") {
+                        subBody += "goto ";
+                        subBody += endLabel;
+                        i = j;
+                        continue;
+                    }
+                    subBody.append(tok);
+                    i = j;
+                    continue;
+                }
+                subBody += c;
+                ++i;
+            }
+
+            std::vector<std::string> expanded;
+            std::size_t st = 0;
+            for (std::size_t k = 0; k <= subBody.size(); ++k) {
+                if (k == subBody.size() || subBody[k] == '\n') {
+                    std::string_view piece = trim(std::string_view{subBody}.substr(st, k - st));
+                    if (!piece.empty()) expanded.emplace_back(piece);
+                    st = k + 1;
+                }
+            }
+            expanded.push_back(endLabel + ":");
+
+            for (auto it = expanded.rbegin(); it != expanded.rend(); ++it) {
+                pendingLines.push_front(PendingLine{std::move(*it), originFile, originLine});
+            }
+            continue;
+        }
+
+        // `if (<expr>) { <body> }` or `if (<expr>) { <body> } else { <body> }`
+        // -- block form.
+        //
+        //   no-else: lowered to the engine's single-branch-skip shape via
+        //            `if (negate(cond)) goto __if_end_N; <body> __if_end_N:`
+        //            (no two-way jump).  Negator in predicate_neg.hpp.
+        //   with-else: lowered to the two-way jump shape that encodeIfStmt
+        //              already handles: `if (cond) goto __if_then_N; else
+        //              goto __if_else_N; __if_then_N: <body_then>; goto
+        //              __if_end_N; __if_else_N: <body_else>; __if_end_N:`.
+        //              No negation needed (both arms jump unconditionally).
+        //
+        // Disambiguates from the legacy `if (<expr>) goto <label>;` form by
+        // requiring `{` after the closing `)`.  `else if` is NOT supported
+        // as a shorthand in v2 -- write `else { if (...) {...} }`.
+        if (inSection && startsWith(line, "if")
+            && line.size() > 2 && (line[2] == ' ' || line[2] == '(')) {
+            std::size_t lp = line.find('(');
+            std::size_t rp = (lp != std::string_view::npos)
+                                ? findMatchingRparen(line, lp)
+                                : std::string_view::npos;
+            std::string_view tail = (rp != std::string_view::npos)
+                                        ? line.substr(rp + 1)
+                                        : std::string_view{};
+            while (!tail.empty() && (tail.front() == ' ' || tail.front() == '\t')) tail.remove_prefix(1);
+            if (!tail.empty() && tail.front() == '{') {
+                // Copy cond out -- pullLine() below invalidates the view.
+                std::string cond{trim(line.substr(lp + 1, rp - lp - 1))};
+
+                // Helper: collect a brace-delimited body across pulled lines.
+                // Body chars accumulated in `out`; `afterClose` receives the
+                // remainder of the line that contained the matching `}` (so
+                // a same-line `} else {` is detectable without re-pulling).
+                auto collectBracedBody = [&](std::string_view startLine,
+                                             std::size_t openBraceIdx,
+                                             std::string& out,
+                                             std::string& afterClose) {
+                    int depth = 1;
+                    bool done = false;
+                    if (openBraceIdx != std::string_view::npos) {
+                        for (std::size_t i = openBraceIdx + 1; i < startLine.size(); ++i) {
+                            char c = startLine[i];
+                            if (c == '{') ++depth;
+                            else if (c == '}') {
+                                --depth;
+                                if (depth == 0) {
+                                    afterClose.assign(startLine.substr(i + 1));
+                                    done = true;
+                                    break;
+                                }
+                            }
+                            out += c;
+                        }
+                    }
+                    while (!done) {
+                        if (!pullLine()) throw std::runtime_error("if-block: unterminated body");
+                        std::string_view raw2 = current.text;
+                        if (!raw2.empty() && raw2.back() == '\r') raw2.remove_suffix(1);
+                        std::string_view s2 = stripLineComment(raw2);
+                        out += '\n';
+                        for (std::size_t i = 0; i < s2.size(); ++i) {
+                            char c = s2[i];
+                            if (c == '{') ++depth;
+                            else if (c == '}') {
+                                --depth;
+                                if (depth == 0) {
+                                    afterClose.assign(s2.substr(i + 1));
+                                    done = true;
+                                    break;
+                                }
+                            }
+                            out += c;
+                        }
+                    }
+                };
+
+                std::size_t lb = line.find('{', rp + 1);
+                std::string body;
+                std::string afterClose;
+                collectBracedBody(line, lb, body, afterClose);
+
+                // Collect the chain: zero or more `elsif`/`else if (cond) { ... }`
+                // branches plus an optional final `else { ... }`.
+                //
+                //   `elsif (c) { ... }` is Ruby-style sugar -- accepted at parse
+                //   time but never emitted by disasm (which always renders the
+                //   canonical `else if`).
+                std::vector<std::pair<std::string, std::string>> chain;  // (cond, body)
+                std::string finalElseBody;
+                bool hasFinalElse = false;
+
+                while (true) {
+                    // Detect whether the next non-whitespace token is `else`,
+                    // `elsif`, or none.  Source may be on the same line as the
+                    // just-closed `}` (in afterClose) or on the next pulled line.
+                    std::string keywordLine;
+                    bool present = false;
+                    {
+                        std::string_view peek = trim(afterClose);
+                        if (startsWith(peek, "else") || startsWith(peek, "elsif")) {
+                            keywordLine.assign(afterClose);
+                            present = true;
+                        } else if (peek.empty()) {
+                            if (pullLine()) {
+                                std::string_view raw2 = current.text;
+                                if (!raw2.empty() && raw2.back() == '\r') raw2.remove_suffix(1);
+                                std::string_view s2 = stripLineComment(raw2);
+                                if (startsWith(trim(s2), "else") || startsWith(trim(s2), "elsif")) {
+                                    keywordLine.assign(s2);
+                                    present = true;
+                                } else {
+                                    // Not ours -- push back verbatim so the pull
+                                    // loop sees it next.
+                                    pendingLines.push_front(PendingLine{
+                                        std::string{current.text},
+                                        current.srcFile,
+                                        current.srcLine});
+                                }
+                            }
+                        }
+                    }
+                    if (!present) break;
+
+                    // Strip leading whitespace, then the keyword.  Decide whether
+                    // this branch is a chained conditional (`elsif`/`else if`)
+                    // or the terminal `else { ... }`.
+                    std::string_view rest = trim(std::string_view{keywordLine});
+                    bool isChained = false;
+                    if (startsWith(rest, "elsif")) {
+                        rest.remove_prefix(5);
+                        isChained = true;
+                    } else {
+                        rest.remove_prefix(4);  // "else"
+                        std::string_view rt = rest;
+                        while (!rt.empty() && (rt.front() == ' ' || rt.front() == '\t')) rt.remove_prefix(1);
+                        if (startsWith(rt, "if ") || startsWith(rt, "if(")) {
+                            rest = rt;
+                            rest.remove_prefix(2);  // "if"
+                            isChained = true;
+                        }
+                    }
+                    while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) {
+                        rest.remove_prefix(1);
+                    }
+
+                    std::string branchCond;
+                    if (isChained) {
+                        if (rest.empty() || rest.front() != '(') {
+                            throw std::runtime_error("else-if: expected '(' after 'elsif'/'else if'");
+                        }
+                        std::size_t crp = findMatchingRparen(rest, 0);
+                        if (crp == std::string_view::npos) {
+                            throw std::runtime_error("else-if: unmatched '('");
+                        }
+                        branchCond.assign(trim(rest.substr(1, crp - 1)));
+                        rest = rest.substr(crp + 1);
+                        while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) {
+                            rest.remove_prefix(1);
+                        }
+                    }
+
+                    // Expect `{` -- on the same line or on a subsequent line.
+                    std::size_t branchLb = std::string_view::npos;
+                    if (!rest.empty() && rest.front() == '{') {
+                        branchLb = 0;
+                    } else {
+                        while (branchLb == std::string_view::npos) {
+                            if (!pullLine()) {
+                                throw std::runtime_error("if-block else/elsif: missing '{'");
+                            }
+                            std::string_view raw2 = current.text;
+                            if (!raw2.empty() && raw2.back() == '\r') raw2.remove_suffix(1);
+                            std::string_view s2 = trim(stripLineComment(raw2));
+                            if (!s2.empty() && s2.front() == '{') {
+                                rest = s2;
+                                branchLb = 0;
+                            } else if (!s2.empty()) {
+                                throw std::runtime_error("if-block else/elsif: expected '{'");
+                            }
+                        }
+                    }
+                    std::string branchBody;
+                    std::string branchAfter;
+                    collectBracedBody(rest, branchLb, branchBody, branchAfter);
+
+                    if (isChained) {
+                        chain.emplace_back(std::move(branchCond), std::move(branchBody));
+                        afterClose = std::move(branchAfter);
+                        // Loop again -- there may be more chain.
+                    } else {
+                        finalElseBody = std::move(branchBody);
+                        hasFinalElse = true;
+                        break;
+                    }
+                }
+
+                int id = nextIfId++;
+
+                // Lower to the engine's single-branch-skip shape (matches the
+                // shipping corpus).  Each branch becomes `if (negate(c_k)) goto
+                // bypass_k; body_k; goto endLabel; bypass_k:`.  For the LAST
+                // branch with no final else, reuse endLabel directly as the
+                // bypass -- skips a no-op jump and matches the byte shape of
+                // a nested-if encoding (`else { if (...) {...} }`) exactly.
+                std::vector<std::pair<std::string, std::string>> branches;
+                branches.emplace_back(std::move(cond), std::move(body));
+                for (auto& b : chain) branches.push_back(std::move(b));
+
+                std::vector<std::string> expanded;
+                auto appendBodyLines = [&](const std::string& src) {
+                    std::size_t st = 0;
+                    for (std::size_t k = 0; k <= src.size(); ++k) {
+                        if (k == src.size() || src[k] == '\n') {
+                            std::string_view piece = trim(std::string_view{src}.substr(st, k - st));
+                            if (!piece.empty()) expanded.emplace_back(piece);
+                            st = k + 1;
+                        }
+                    }
+                };
+                std::string endLabel = "__if_end_" + std::to_string(id);
+
+                if (branches.size() == 1 && !hasFinalElse) {
+                    // v1: simple single-arm.
+                    std::string negated = predneg::negatePredicate(branches[0].first);
+                    expanded.push_back("if (" + negated + ") goto " + endLabel + ";");
+                    appendBodyLines(branches[0].second);
+                    expanded.push_back(endLabel + ":");
+                } else {
+                    for (std::size_t k = 0; k < branches.size(); ++k) {
+                        bool isLast = (k + 1 == branches.size());
+                        bool reuseEnd = isLast && !hasFinalElse;
+                        std::string bypassLabel = reuseEnd
+                            ? endLabel
+                            : ("__if_else_" + std::to_string(id) + "_" + std::to_string(k));
+                        std::string neg_k = predneg::negatePredicate(branches[k].first);
+                        expanded.push_back("if (" + neg_k + ") goto " + bypassLabel + ";");
+                        appendBodyLines(branches[k].second);
+                        if (!reuseEnd) {
+                            expanded.push_back("goto " + endLabel + ";");
+                            expanded.push_back(bypassLabel + ":");
+                        }
+                    }
+                    if (hasFinalElse) {
+                        appendBodyLines(finalElseBody);
+                    }
+                    expanded.push_back(endLabel + ":");
+                }
+
+                for (auto it = expanded.rbegin(); it != expanded.rend(); ++it) {
+                    pendingLines.push_front(PendingLine{std::move(*it), originFile, originLine});
+                }
+                continue;
+            }
+            // No `{` after `)`: fall through to the legacy goto-form handler.
+        }
+
         // `for <ident> in [<vals>] { <body> }`   -- explicit list
         // `for <ident> in <start>..<end> { <body> }` -- inclusive integer range
-        // Both forms unroll at parse time (the VM has no loops).
+        // `for <a>, <b> in [<k> => <v>, ...] { <body> }` -- pair-destructure
+        // All forms unroll at parse time (the VM has no loops).
         if (inSection && startsWith(line, "for ")) {
             std::string_view r = line.substr(4);
             while (!r.empty() && (r[0] == ' ' || r[0] == '\t')) r.remove_prefix(1);
@@ -1341,6 +2065,18 @@ ContainerAST parseSource(std::string_view text) {
             std::string iterName{iterView};
             r.remove_prefix(iterView.size());
             while (!r.empty() && (r[0] == ' ' || r[0] == '\t')) r.remove_prefix(1);
+            // Optional second iterator: `for a, b in ...` -- destructures
+            // pair-list elements (each `key => value`).
+            std::string iterName2;
+            if (!r.empty() && r[0] == ',') {
+                r.remove_prefix(1);
+                while (!r.empty() && (r[0] == ' ' || r[0] == '\t')) r.remove_prefix(1);
+                std::string_view i2 = leadingIdent(r);
+                if (i2.empty()) throw std::runtime_error("for: expected second iterator name after `,`");
+                iterName2.assign(i2);
+                r.remove_prefix(i2.size());
+                while (!r.empty() && (r[0] == ' ' || r[0] == '\t')) r.remove_prefix(1);
+            }
             if (!startsWith(r, "in")) throw std::runtime_error("for: expected 'in'");
             r.remove_prefix(2);
             while (!r.empty() && (r[0] == ' ' || r[0] == '\t')) r.remove_prefix(1);
@@ -1457,7 +2193,32 @@ ContainerAST parseSource(std::string_view text) {
             // top-level `;`; we normalize to one statement per pending line.
             std::vector<std::string> expanded;
             for (const auto& val : values) {
-                std::string subBody = substituteIdent(body, iterName, val);
+                std::string subBody;
+                if (iterName2.empty()) {
+                    subBody = substituteIdent(body, iterName, val);
+                } else {
+                    // Destructuring: split element on top-level `=>`.
+                    auto findArrow = [](std::string_view s) -> std::size_t {
+                        int dp = 0;
+                        for (std::size_t k = 0; k + 1 < s.size(); ++k) {
+                            char c = s[k];
+                            if (c == '(' || c == '[' || c == '{') ++dp;
+                            else if (c == ')' || c == ']' || c == '}') --dp;
+                            else if (dp == 0 && c == '=' && s[k + 1] == '>') return k;
+                        }
+                        return std::string_view::npos;
+                    };
+                    std::size_t arrow = findArrow(val);
+                    if (arrow == std::string_view::npos) {
+                        throw std::runtime_error(
+                            "for: pair-destructure expects `key => value`, got `"
+                            + val + "`");
+                    }
+                    std::string lhs{trim(std::string_view{val}.substr(0, arrow))};
+                    std::string rhs{trim(std::string_view{val}.substr(arrow + 2))};
+                    subBody = substituteIdent(body,    iterName,  lhs);
+                    subBody = substituteIdent(subBody, iterName2, rhs);
+                }
                 for (auto piece : splitTopSemis(subBody)) {
                     std::string_view tp = trim(piece);
                     if (tp.empty()) continue;
@@ -1844,8 +2605,13 @@ ContainerAST parseSource(std::string_view text) {
                             }
                             for (std::size_t k = 0; k < def.params.size(); ++k) {
                                 if (!filled[k]) {
-                                    throw std::runtime_error(std::string{"function "} + std::string{ident}
-                                        + ": missing argument for `" + def.params[k].name + "`");
+                                    if (def.params[k].defaultExpr.has_value()) {
+                                        args[k] = *def.params[k].defaultExpr;
+                                        filled[k] = true;
+                                    } else {
+                                        throw std::runtime_error(std::string{"function "} + std::string{ident}
+                                            + ": missing argument for `" + def.params[k].name + "`");
+                                    }
                                 }
                             }
 
@@ -1880,12 +2646,50 @@ ContainerAST parseSource(std::string_view text) {
                                     auto items = splitTopCommas(a.substr(1, a.size() - 2));
                                     std::string out = "[";
                                     bool first = true;
-                                    for (auto it : items) {
-                                        std::string_view t = trim(it);
-                                        if (t.empty()) continue;
-                                        if (!first) out += ", ";
-                                        out += toDec(static_cast<long long>(resolveTyped(t, *p.kind)));
-                                        first = false;
+                                    if (p.kind2) {
+                                        // Pair-array `(K1, K2)[]`: each element
+                                        // is `K => V`.  Resolve K in kind, V in
+                                        // kind2; emit the pair as `<n1> => <n2>`
+                                        // so the body's destructuring `for a, b`
+                                        // can split it again.
+                                        auto findArrow = [](std::string_view s) -> std::size_t {
+                                            int dp = 0;
+                                            for (std::size_t kk = 0; kk + 1 < s.size(); ++kk) {
+                                                char c = s[kk];
+                                                if (c == '(' || c == '[' || c == '{') ++dp;
+                                                else if (c == ')' || c == ']' || c == '}') --dp;
+                                                else if (dp == 0 && c == '=' && s[kk + 1] == '>') return kk;
+                                            }
+                                            return std::string_view::npos;
+                                        };
+                                        for (auto it : items) {
+                                            std::string_view t = trim(it);
+                                            if (t.empty()) continue;
+                                            std::size_t ar = findArrow(t);
+                                            if (ar == std::string_view::npos) {
+                                                throw std::runtime_error(std::string{"function "} + std::string{ident}
+                                                    + ": param `" + p.name + ": ("
+                                                    + std::string{symKindLabel(*p.kind)} + ", "
+                                                    + std::string{symKindLabel(*p.kind2)}
+                                                    + ")[]` expected `K => V` element, got `"
+                                                    + std::string{t} + "`");
+                                            }
+                                            std::string_view lhs = trim(t.substr(0, ar));
+                                            std::string_view rhs = trim(t.substr(ar + 2));
+                                            if (!first) out += ", ";
+                                            out += toDec(static_cast<long long>(resolveTyped(lhs, *p.kind)));
+                                            out += " => ";
+                                            out += toDec(static_cast<long long>(resolveTyped(rhs, *p.kind2)));
+                                            first = false;
+                                        }
+                                    } else {
+                                        for (auto it : items) {
+                                            std::string_view t = trim(it);
+                                            if (t.empty()) continue;
+                                            if (!first) out += ", ";
+                                            out += toDec(static_cast<long long>(resolveTyped(t, *p.kind)));
+                                            first = false;
+                                        }
                                     }
                                     out += "]";
                                     args[k] = std::move(out);
@@ -3088,7 +3892,7 @@ std::vector<u8> encodeInstr(const Instr& instr, const Resolver& resolve) {
                             throw std::runtime_error(
                                 std::string{"raw: unknown kind `"} + std::string{kindTok}
                                 + "` (expected capitalized kind: Digimon, Entity, Item, Move, "
-                                  "Stat, Condition, Map, Trigger, PStat)");
+                                  "Stat, Condition, Map, Trigger, PStat, Animation)");
                         }
                         expr = trim(t.substr(bang + 1));
                     }
