@@ -84,6 +84,8 @@ const std::unordered_map<u16, std::string_view>& smallCharMap() {
         {0x4781, ";"},
         {0x4881, "?"},
         {0x4981, "!"},
+        {0x5083, "û"},
+        {0x6681, "'"},
         {0x7581, "'"},
         {0x7681, "\""},
         {0x7c81, "-"},
